@@ -142,16 +142,53 @@ This avoids the conflict with the UART bridge pins D6/D7.
 - RAM: 12.3% (29,068 / 235,520 bytes)
 - Flash: 60.0% (425,472 / 708,608 bytes)
 
-### 2026-04-04 - Hardware Testing
+### 2026-04-04 - Hardware Testing Update
 - Bridge initializes correctly (BRIDGE_DEBUG enabled)
-- TX works - data sent from Xiao to RAK4631
-- RX issue - nothing being received
+- TX works - data sent from Xiao to RAK4631  
+- RX working with new cables - data received but with buffer offset issue
 - Connected to RAK4631 (WisMesh Board ONE) using Serial2:
   - RAK Serial2: RX=P0.19, TX=P0.20
   - Xiao Serial1: RX=D7 (P1.12), TX=D6 (P1.11)
   - Wired: Xiao D6→RAK RX, Xiao D7←RAK TX (crossed)
 - Added heartbeat debug every 10s to confirm loop running
 - Added RX pin state debug every 5s to monitor voltage
+- Added INPUT_PULLUP on RX pin to prevent floating input
+- Added verbose RX debug showing byte-by-byte reception
+- Added invalid magic byte reset logging
+
+## Current Status
+
+**Bridge Communication: PARTIAL - Data flowing but parsing issue**
+
+**Symptoms:**
+- RX pin shows correct behavior (HIGH when idle with pullup)
+- Data bytes visible on RX line
+- Packet framing visible (0xC0 0x3E magic bytes present)
+- But packet parsing starts at buffer offset 109 instead of 0
+- Suggests stale data in buffer causing misaligned packet parsing
+
+**Root Cause Hypothesis:**
+Buffer not properly reset when invalid data received, allowing offset accumulation when valid magic bytes appear later in the stream.
+
+**Next Debug Step:**
+Add buffer reset logging when invalid magic bytes are received to track when and why buffer position advances.
+
+## Next Steps
+
+1. [x] Decide on fix option (A, B, or C)
+2. [x] Implement the fix in platformio.ini and/or XiaoNrf52Board.cpp
+3. [x] Rebuild firmware
+4. [x] Retest D6/D7 voltage levels
+5. [ ] Verify bridge communication works (in progress - buffer offset issue)
+
+## Questions to Resolve
+
+1. Is I2C actually needed for this variant? (Sensors are configured but may not be present)
+   - **Answer:** No sensors present, but Wire initialization moved to D16/D17
+2. Should we use D16/D17 for Wire (as variant.h comment suggests)?
+   - **Answer:** Yes, implemented
+3. Why does packet parsing start at wrong buffer offset?
+   - Buffer not resetting properly when invalid data precedes valid packet
 
 ## Next Steps
 
