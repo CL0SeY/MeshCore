@@ -55,9 +55,23 @@ void RS232Bridge::loop() {
     return;
   }
 
+  static uint32_t last_debug = 0;
+  if (millis() - last_debug > 10000) {
+    BRIDGE_DEBUG_PRINTLN("Bridge heartbeat, rxPos=%d\n", _rx_buffer_pos);
+    last_debug = millis();
+  }
+
   int avail = _serial->available();
   if (avail > 0) {
     BRIDGE_DEBUG_PRINTLN("RX data available, count=%d\n", avail);
+  }
+
+  // Periodic pin state check
+  static uint32_t last_pin_check = 0;
+  if (millis() - last_pin_check > 5000) {
+    int rx_state = digitalRead(WITH_RS232_BRIDGE_RX);
+    BRIDGE_DEBUG_PRINTLN("RX pin %d state: %d\n", WITH_RS232_BRIDGE_RX, rx_state);
+    last_pin_check = millis();
   }
 
   while (_serial->available()) {
