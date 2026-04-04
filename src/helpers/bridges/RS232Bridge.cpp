@@ -15,6 +15,10 @@ void RS232Bridge::begin() {
 
   BRIDGE_DEBUG_PRINTLN("Setting UART pins RX=%d, TX=%d\n", WITH_RS232_BRIDGE_RX, WITH_RS232_BRIDGE_TX);
 
+  // Configure pins explicitly before setting UART
+  pinMode(WITH_RS232_BRIDGE_RX, INPUT);
+  pinMode(WITH_RS232_BRIDGE_TX, OUTPUT);
+
 #if defined(ESP32)
   ((HardwareSerial *)_serial)->setPins(WITH_RS232_BRIDGE_RX, WITH_RS232_BRIDGE_TX);
 #elif defined(NRF52_PLATFORM)
@@ -51,8 +55,9 @@ void RS232Bridge::loop() {
     return;
   }
 
-  if (_serial->available()) {
-    BRIDGE_DEBUG_PRINTLN("RX data available, count=%d\n", _serial->available());
+  int avail = _serial->available();
+  if (avail > 0) {
+    BRIDGE_DEBUG_PRINTLN("RX data available, count=%d\n", avail);
   }
 
   while (_serial->available()) {
