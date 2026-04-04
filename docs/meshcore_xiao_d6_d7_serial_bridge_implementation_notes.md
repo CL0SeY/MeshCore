@@ -181,15 +181,6 @@ Add buffer reset logging when invalid magic bytes are received to track when and
 4. [x] Retest D6/D7 voltage levels
 5. [ ] Verify bridge communication works (in progress - buffer offset issue)
 
-## Questions to Resolve
-
-1. Is I2C actually needed for this variant? (Sensors are configured but may not be present)
-   - **Answer:** No sensors present, but Wire initialization moved to D16/D17
-2. Should we use D16/D17 for Wire (as variant.h comment suggests)?
-   - **Answer:** Yes, implemented
-3. Why does packet parsing start at wrong buffer offset?
-   - Buffer not resetting properly when invalid data precedes valid packet
-
 ## Next Steps
 
 1. [x] Decide on fix option (A, B, or C)
