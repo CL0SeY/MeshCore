@@ -53,6 +53,8 @@ static const uint8_t D7  = 7 ;
 static const uint8_t D8  = 8 ;
 static const uint8_t D9  = 9 ;
 static const uint8_t D10 = 10;
+static const uint8_t D16 = 16;
+static const uint8_t D17 = 17;
 
 #define VBAT_ENABLE             (14)    // Output LOW to enable reading of the BAT voltage.
                                         // https://wiki.seeedstudio.com/XIAO_BLE#q3-what-are-the-considerations-when-using-xiao-nrf52840-sense-for-battery-charging
