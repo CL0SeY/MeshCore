@@ -51,8 +51,14 @@ void RS232Bridge::loop() {
     return;
   }
 
+  if (_serial->available()) {
+    BRIDGE_DEBUG_PRINTLN("RX data available, count=%d\n", _serial->available());
+  }
+
   while (_serial->available()) {
     uint8_t b = _serial->read();
+
+    BRIDGE_DEBUG_PRINTLN("RX byte: 0x%02X pos=%d\n", b, _rx_buffer_pos);
 
     if (_rx_buffer_pos < 2) {
       // Waiting for magic word
