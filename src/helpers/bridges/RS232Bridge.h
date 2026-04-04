@@ -143,6 +143,15 @@ private:
 
   /** Current position in the receive buffer */
   uint16_t _rx_buffer_pos = 0;
+
+  /**
+   * @brief Resync buffer by scanning for magic bytes pattern
+   *
+   * When a packet fails (bad length or checksum), scans the current
+   * buffer for the magic bytes pattern to find where the next valid
+   * packet might start, rather than blindly resetting to position 0.
+   */
+  void resyncBuffer();
 };
 
 #endif

@@ -101,8 +101,8 @@ void RS232Bridge::loop() {
 
         // Validate length field
         if (len > (MAX_TRANS_UNIT + 1)) {
-          BRIDGE_DEBUG_PRINTLN("RX invalid length %d, resetting\n", len);
-          _rx_buffer_pos = 0; // Invalid length, reset
+          BRIDGE_DEBUG_PRINTLN("RX invalid length %d, scanning for magic...\n", len);
+          resyncBuffer();
           continue;
         }
 
@@ -123,7 +123,9 @@ void RS232Bridge::loop() {
               BRIDGE_DEBUG_PRINTLN("RX failed to allocate packet\n");
             }
           } else {
-            BRIDGE_DEBUG_PRINTLN("RX checksum mismatch, rcv=0x%04x\n", received_checksum);
+            BRIDGE_DEBUG_PRINTLN("RX checksum mismatch, rcv=0x%04x, scanning for magic...\n", received_checksum);
+            resyncBuffer();
+            continue;
           }
           _rx_buffer_pos = 0; // Reset for next packet
         }
@@ -175,6 +177,28 @@ void RS232Bridge::sendPacket(mesh::Packet *packet) {
 
 void RS232Bridge::onPacketReceived(mesh::Packet *packet) {
   handleReceivedPacket(packet);
+}
+
+void RS232Bridge::resyncBuffer() {
+  static constexpr uint8_t MAGIC_HIGH = (BRIDGE_PACKET_MAGIC >> 8) & 0xFF;
+  static constexpr uint8_t MAGIC_LOW = BRIDGE_PACKET_MAGIC & 0xFF;
+
+  // Scan buffer for magic bytes pattern to find where next valid packet starts
+  for (uint16_t i = 0; i < _rx_buffer_pos - 1; i++) {
+    if (_rx_buffer[i] == MAGIC_HIGH && _rx_buffer[i + 1] == MAGIC_LOW) {
+      // Found magic pattern - shift remaining data to start of buffer
+      uint16_t remaining = _rx_buffer_pos - (i + 2);
+      for (uint16_t j = 0; j < remaining; j++) {
+        _rx_buffer[j] = _rx_buffer[i + 2 + j];
+      }
+      _rx_buffer_pos = remaining;
+      BRIDGE_DEBUG_PRINTLN("RX resync: found magic at pos %d, kept %d bytes\n", i, remaining);
+      return;
+    }
+  }
+
+  // No magic pattern found, reset completely
+  _rx_buffer_pos = 0;
 }
 
 #endif

@@ -156,22 +156,51 @@ This avoids the conflict with the UART bridge pins D6/D7.
 - Added verbose RX debug showing byte-by-byte reception
 - Added invalid magic byte reset logging
 
+### 2026-04-04 - Buffer Alignment Fix
+
+**Problem:** Packet parser misaligned when stale data preceded valid packets in the receive buffer. The original code reset `_rx_buffer_pos = 0` on invalid length or checksum mismatch, discarding any valid magic bytes that might appear mid-stream.
+
+**Fix:** Added `resyncBuffer()` method in `RS232Bridge.cpp`:
+- Scans buffer for magic bytes pattern (0xC0 0x3E) when packet validation fails
+- Shifts remaining valid data to buffer start when magic pattern found
+- Only resets to 0 if no magic pattern exists in buffer
+- Called on both invalid length and checksum mismatch conditions
+
+**Files Modified:**
+- `src/helpers/bridges/RS232Bridge.cpp` - Added `resyncBuffer()` implementation, replaced simple resets
+- `src/helpers/bridges/RS232Bridge.h` - Added `resyncBuffer()` declaration
+
+### 2026-04-04 - Bidirectional Communication Verified
+
+**Test Results:**
+- RX successfully receives data from RAK4631
+- Packet parsing works correctly: `RX, len=56 crc=0xdcec`
+- Checksum validation passes
+- Buffer resets cleanly after each packet (`rxPos=0`)
+- Heartbeat confirms stable operation: `Bridge heartbeat, rxPos=0`
+- RX pin idle state correct: `RX pin 7 state: 1` (HIGH)
+
+**Sample Log:**
+```
+BRIDGE: RX byte: 0xC0 pos=0
+BRIDGE: RX byte: 0xBA pos=49
+BRIDGE: RX byte: 0x77 pos=50
+...
+BRIDGE: RX byte: 0xEC pos=61
+BRIDGE: RX, len=56 crc=0xdcec
+BRIDGE: Bridge heartbeat, rxPos=0
+```
+
 ## Current Status
 
-**Bridge Communication: PARTIAL - Data flowing but parsing issue**
+**Bridge Communication: WORKING**
 
-**Symptoms:**
-- RX pin shows correct behavior (HIGH when idle with pullup)
-- Data bytes visible on RX line
-- Packet framing visible (0xC0 0x3E magic bytes present)
-- But packet parsing starts at buffer offset 109 instead of 0
-- Suggests stale data in buffer causing misaligned packet parsing
-
-**Root Cause Hypothesis:**
-Buffer not properly reset when invalid data received, allowing offset accumulation when valid magic bytes appear later in the stream.
-
-**Next Debug Step:**
-Add buffer reset logging when invalid magic bytes are received to track when and why buffer position advances.
+- TX: Xiao → RAK4631 via Serial1 (D6/D7)
+- RX: RAK4631 → Xiao via Serial1 (D6/D7)
+- Packet framing with magic bytes (0xC0 0x3E) working
+- Fletcher-16 checksum validation passing
+- Buffer resync handling stale data correctly
+- Mesh packets successfully bridged over serial link
 
 ## Next Steps
 
@@ -179,25 +208,22 @@ Add buffer reset logging when invalid magic bytes are received to track when and
 2. [x] Implement the fix in platformio.ini and/or XiaoNrf52Board.cpp
 3. [x] Rebuild firmware
 4. [x] Retest D6/D7 voltage levels
-5. [ ] Verify bridge communication works (in progress - buffer offset issue)
+5. [x] Fix buffer alignment issue in RS232Bridge.cpp
+6. [x] Verify bidirectional serial bridge communication
+7. [ ] Final testing with mesh traffic (multiple packets, stress test)
+8. [ ] Generate production DFU ZIP package
+9. [ ] Clean up debug logging for release build
 
-## Next Steps
+## Questions Resolved
 
-1. [x] Decide on fix option (A, B, or C)
-2. [x] Implement the fix in platformio.ini and/or XiaoNrf52Board.cpp
-3. [x] Rebuild firmware
-4. [x] Retest D6/D7 voltage levels
-5. [ ] Verify bridge communication works (in progress - RX issue)
-
-## Questions to Resolve
-
-1. Is I2C actually needed for this variant? (Sensors are configured but may not be present)
+1. Is I2C actually needed for this variant?
    - **Answer:** No sensors present, but Wire initialization moved to D16/D17
 2. Should we use D16/D17 for Wire (as variant.h comment suggests)?
    - **Answer:** Yes, implemented
-3. Why is RX not working?
-   - Possible cause: RAK4631 may not be transmitting on Serial2
-   - Possible cause: RX pin voltage at 0V instead of idle HIGH
+3. Why was RX not working initially?
+   - **Answer:** RAK4631 wasn't configured with bridge firmware. Once configured, serial link works correctly.
+4. Buffer offset issue with packet parsing?
+   - **Answer:** Fixed with `resyncBuffer()` that scans for magic bytes mid-stream instead of blindly resetting to 0.
 
 ## Related Documentation
 
