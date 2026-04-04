@@ -16,7 +16,7 @@ void RS232Bridge::begin() {
   BRIDGE_DEBUG_PRINTLN("Setting UART pins RX=%d, TX=%d\n", WITH_RS232_BRIDGE_RX, WITH_RS232_BRIDGE_TX);
 
   // Configure pins explicitly before setting UART
-  pinMode(WITH_RS232_BRIDGE_RX, INPUT);
+  pinMode(WITH_RS232_BRIDGE_RX, INPUT_PULLUP);
   pinMode(WITH_RS232_BRIDGE_TX, OUTPUT);
 
 #if defined(ESP32)
