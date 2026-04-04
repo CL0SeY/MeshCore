@@ -10,8 +10,10 @@ RS232Bridge::RS232Bridge(NodePrefs *prefs, Stream &serial, mesh::PacketManager *
 void RS232Bridge::begin() {
   BRIDGE_DEBUG_PRINTLN("Initializing at %d baud...\n", _prefs->bridge_baud);
 #if !defined(WITH_RS232_BRIDGE_RX) || !defined(WITH_RS232_BRIDGE_TX)
-#error "WITH_RS232_BRIDGE_RX and WITH_RS232_BRIDGE_TX must be defined"
+  #error "WITH_RS232_BRIDGE_RX and WITH_RS232_BRIDGE_TX must be defined"
 #endif
+
+  BRIDGE_DEBUG_PRINTLN("Setting UART pins RX=%d, TX=%d\n", WITH_RS232_BRIDGE_RX, WITH_RS232_BRIDGE_TX);
 
 #if defined(ESP32)
   ((HardwareSerial *)_serial)->setPins(WITH_RS232_BRIDGE_RX, WITH_RS232_BRIDGE_TX);
@@ -25,9 +27,11 @@ void RS232Bridge::begin() {
   ((HardwareSerial *)_serial)->setRx(WITH_RS232_BRIDGE_RX);
   ((HardwareSerial *)_serial)->setTx(WITH_RS232_BRIDGE_TX);
 #else
-#error RS232Bridge was not tested on the current platform
+  #error RS232Bridge was not tested on the current platform
 #endif
   ((HardwareSerial *)_serial)->begin(_prefs->bridge_baud);
+
+  BRIDGE_DEBUG_PRINTLN("Serial bridge initialized\n");
 
   // Update bridge state
   _initialized = true;
