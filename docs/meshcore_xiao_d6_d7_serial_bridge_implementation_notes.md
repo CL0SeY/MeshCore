@@ -142,19 +142,34 @@ This avoids the conflict with the UART bridge pins D6/D7.
 - RAM: 12.3% (29,068 / 235,520 bytes)
 - Flash: 60.0% (425,472 / 708,608 bytes)
 
+### 2026-04-04 - Hardware Testing
+- Bridge initializes correctly (BRIDGE_DEBUG enabled)
+- TX works - data sent from Xiao to RAK4631
+- RX issue - nothing being received
+- Connected to RAK4631 (WisMesh Board ONE) using Serial2:
+  - RAK Serial2: RX=P0.19, TX=P0.20
+  - Xiao Serial1: RX=D7 (P1.12), TX=D6 (P1.11)
+  - Wired: Xiao D6→RAK RX, Xiao D7←RAK TX (crossed)
+- Added heartbeat debug every 10s to confirm loop running
+- Added RX pin state debug every 5s to monitor voltage
+
 ## Next Steps
 
 1. [x] Decide on fix option (A, B, or C)
 2. [x] Implement the fix in platformio.ini and/or XiaoNrf52Board.cpp
 3. [x] Rebuild firmware
-4. [ ] Retest D6/D7 voltage levels
-5. [ ] Verify bridge communication works
+4. [x] Retest D6/D7 voltage levels
+5. [ ] Verify bridge communication works (in progress - RX issue)
 
 ## Questions to Resolve
 
 1. Is I2C actually needed for this variant? (Sensors are configured but may not be present)
+   - **Answer:** No sensors present, but Wire initialization moved to D16/D17
 2. Should we use D16/D17 for Wire (as variant.h comment suggests)?
-3. Or is it acceptable to disable Wire entirely for the bridge variant?
+   - **Answer:** Yes, implemented
+3. Why is RX not working?
+   - Possible cause: RAK4631 may not be transmitting on Serial2
+   - Possible cause: RX pin voltage at 0V instead of idle HIGH
 
 ## Related Documentation
 
