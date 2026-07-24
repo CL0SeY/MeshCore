@@ -2,6 +2,7 @@
 #include <Mesh.h>
 
 #include "MyMesh.h"
+#include <helpers/ArduinoSerialInterface.h>
 
 #ifdef DISPLAY_CLASS
   #include "UITask.h"
@@ -13,11 +14,11 @@ SimpleMeshTables tables;
 
 MyMesh the_mesh(board, radio_driver, *new ArduinoMillis(), fast_rng, rtc_clock, tables);
 
+ArduinoSerialInterface serial_interface;
+
 void halt() {
   while (1) ;
 }
-
-static char command[160];
 
 // For power saving
 unsigned long POWERSAVING_FIRSTSLEEP_SECS = 120; // The first sleep (if enabled) from boot
@@ -85,11 +86,12 @@ void setup() {
   Serial.print("Repeater ID: ");
   mesh::Utils::printHex(Serial, the_mesh.self_id.pub_key, PUB_KEY_SIZE); Serial.println();
 
-  command[0] = 0;
-
   sensors.begin();
 
   the_mesh.begin(fs);
+
+  serial_interface.begin(Serial);
+  the_mesh.startInterface(serial_interface);
 
 #ifdef DISPLAY_CLASS
   ui_task.begin(the_mesh.getNodePrefs(), FIRMWARE_BUILD_DATE, FIRMWARE_VERSION);
@@ -104,32 +106,6 @@ void setup() {
 }
 
 void loop() {
-  int len = strlen(command);
-  while (Serial.available() && len < sizeof(command)-1) {
-    char c = Serial.read();
-    if (c != '\n') {
-      command[len++] = c;
-      command[len] = 0;
-      Serial.print(c);
-    }
-    if (c == '\r') break;
-  }
-  if (len == sizeof(command)-1) {  // command buffer full
-    command[sizeof(command)-1] = '\r';
-  }
-
-  if (len > 0 && command[len - 1] == '\r') {  // received complete line
-    Serial.print('\n');
-    command[len - 1] = 0;  // replace newline with C string null terminator
-    char reply[160];
-    the_mesh.handleCommand(0, command, reply);  // NOTE: there is no sender_timestamp via serial!
-    if (reply[0]) {
-      Serial.print("  -> "); Serial.println(reply);
-    }
-
-    command[0] = 0;  // reset command buffer
-  }
-
 #if defined(PIN_USER_BTN) && defined(_SEEED_SENSECAP_SOLAR_H_)
   // Hold the user button to power off the SenseCAP Solar repeater.
   int btnState = digitalRead(PIN_USER_BTN);

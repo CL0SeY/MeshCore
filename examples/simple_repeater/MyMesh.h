@@ -27,6 +27,7 @@
 #include <helpers/ArduinoHelpers.h>
 #include <helpers/ClientACL.h>
 #include <helpers/CommonCLI.h>
+#include <helpers/BaseSerialInterface.h>
 #include <helpers/IdentityStore.h>
 #include <helpers/SimpleMeshTables.h>
 #include <helpers/StaticPoolPacketManager.h>
@@ -80,6 +81,61 @@ struct NeighbourInfo {
 
 #define PACKET_LOG_FILE  "/packet_log"
 
+// Companion protocol command codes
+#define CMD_APP_START                 1
+#define CMD_SEND_TXT_MSG              2
+#define CMD_SEND_CHANNEL_TXT_MSG      3
+#define CMD_GET_CONTACTS              4
+#define CMD_GET_DEVICE_TIME           5
+#define CMD_SET_DEVICE_TIME           6
+#define CMD_SEND_SELF_ADVERT          7
+#define CMD_SET_ADVERT_NAME           8
+#define CMD_SET_RADIO_PARAMS          11
+#define CMD_SET_RADIO_TX_POWER        12
+#define CMD_RESET_PATH                13
+#define CMD_SET_ADVERT_LATLON         14
+#define CMD_DEVICE_QUERY              22
+#define CMD_SEND_RAW_DATA             25
+#define CMD_LOGIN                     26
+#define CMD_HAS_CONNECTION            28
+#define CMD_LOGOUT                    29
+#define CMD_SET_FLOOD_SCOPE_KEY       54
+#define CMD_GET_STATS                 56
+#define CMD_SEND_CHANNEL_DATA         62
+#define CMD_SET_DEFAULT_FLOOD_SCOPE   63
+#define CMD_GET_DEFAULT_FLOOD_SCOPE   64
+#define CMD_SEND_RAW_PACKET           65
+
+// Response codes
+#define RESP_CODE_OK                  0
+#define RESP_CODE_ERR                 1
+#define RESP_CODE_CONTACTS_START      2
+#define RESP_CODE_CONTACT             3
+#define RESP_CODE_END_OF_CONTACTS     4
+#define RESP_CODE_SELF_INFO           5
+#define RESP_CODE_SENT                6
+#define RESP_CODE_CURR_TIME           9
+#define RESP_CODE_NO_MORE_MESSAGES    10
+#define RESP_CODE_DEVICE_INFO         13
+#define RESP_CODE_DISABLED            15
+#define RESP_CODE_STATS               24
+#define RESP_CODE_DEFAULT_FLOOD_SCOPE 28
+
+// Error codes
+#define ERR_CODE_UNSUPPORTED_CMD      1
+#define ERR_CODE_NOT_FOUND            2
+#define ERR_CODE_TABLE_FULL           3
+#define ERR_CODE_BAD_STATE            4
+#define ERR_CODE_ILLEGAL_ARG          6
+
+// Stats sub-types
+#define STATS_TYPE_CORE               0
+#define STATS_TYPE_RADIO              1
+#define STATS_TYPE_PACKETS            2
+
+// Helper macros
+#define MAX_FRAME_SIZE  176
+
 class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   FILESYSTEM* _fs;
   uint32_t last_millis;
@@ -118,6 +174,9 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
 #elif defined(WITH_ESPNOW_BRIDGE)
   ESPNowBridge bridge;
 #endif
+  BaseSerialInterface* _serial;
+  uint8_t cmd_frame[MAX_FRAME_SIZE + 1];
+  uint8_t out_frame[MAX_FRAME_SIZE + 1];
 
   void putNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr);
   uint8_t handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood);
@@ -225,6 +284,15 @@ public:
 
   void handleCommand(uint32_t sender_timestamp, char* command, char* reply);
   void loop();
+
+  // Companion protocol over USB CDC
+  void startInterface(BaseSerialInterface &serial);
+  void handleCmdFrame(size_t len);
+  void checkSerialInterface();
+  void writeOKFrame();
+  void writeErrFrame(uint8_t err_code);
+  void writeDisabledFrame();
+  void writeRepeaterStats(uint8_t stats_type);
 
 #if defined(WITH_BRIDGE)
   void setBridgeState(bool enable) override {

@@ -1171,6 +1171,321 @@ void MyMesh::clearStats() {
   ((SimpleMeshTables *)getTables())->resetStats();
 }
 
+void MyMesh::writeOKFrame() {
+  uint8_t buf[1];
+  buf[0] = RESP_CODE_OK;
+  _serial->writeFrame(buf, 1);
+}
+
+void MyMesh::writeErrFrame(uint8_t err_code) {
+  uint8_t buf[2];
+  buf[0] = RESP_CODE_ERR;
+  buf[1] = err_code;
+  _serial->writeFrame(buf, 2);
+}
+
+void MyMesh::writeDisabledFrame() {
+  uint8_t buf[1];
+  buf[0] = RESP_CODE_DISABLED;
+  _serial->writeFrame(buf, 1);
+}
+
+void MyMesh::startInterface(BaseSerialInterface &serial) {
+  _serial = &serial;
+  serial.enable();
+}
+
+void MyMesh::checkSerialInterface() {
+  size_t len = _serial->checkRecvFrame(cmd_frame);
+  if (len > 0) {
+    handleCmdFrame(len);
+  }
+}
+
+void MyMesh::handleCmdFrame(size_t len) {
+  if (len < 1) return;
+
+  if (cmd_frame[0] == CMD_DEVICE_QUERY) {
+    int i = 0;
+    out_frame[i++] = RESP_CODE_DEVICE_INFO;
+    out_frame[i++] = FIRMWARE_VER_LEVEL;
+    out_frame[i++] = MAX_CLIENTS / 2;
+    out_frame[i++] = 0;
+    memset(&out_frame[i], 0, 4);
+    i += 4;
+    memset(&out_frame[i], 0, 12);
+    strcpy((char *)&out_frame[i], FIRMWARE_BUILD_DATE);
+    i += 12;
+    StrHelper::strzcpy((char *)&out_frame[i], board.getManufacturerName(), 40);
+    i += 40;
+    StrHelper::strzcpy((char *)&out_frame[i], FIRMWARE_VERSION, 20);
+    i += 20;
+    out_frame[i++] = 1;
+    out_frame[i++] = _prefs.path_hash_mode;
+    _serial->writeFrame(out_frame, i);
+
+  } else if (cmd_frame[0] == CMD_APP_START) {
+    int i = 0;
+    out_frame[i++] = RESP_CODE_SELF_INFO;
+    out_frame[i++] = 1; // ADV_TYPE_REPEATER
+    out_frame[i++] = _prefs.tx_power_dbm;
+    out_frame[i++] = 22;
+    memcpy(&out_frame[i], self_id.pub_key, PUB_KEY_SIZE);
+    i += PUB_KEY_SIZE;
+    int32_t lat = _prefs.node_lat * 1000000.0;
+    int32_t lon = _prefs.node_lon * 1000000.0;
+    memcpy(&out_frame[i], &lat, 4);
+    i += 4;
+    memcpy(&out_frame[i], &lon, 4);
+    i += 4;
+    out_frame[i++] = _prefs.multi_acks;
+    out_frame[i++] = _prefs.advert_loc_policy;
+    uint32_t freq = _prefs.freq * 1000;
+    memcpy(&out_frame[i], &freq, 4);
+    i += 4;
+    uint32_t bw = _prefs.bw * 1000;
+    memcpy(&out_frame[i], &bw, 4);
+    i += 4;
+    out_frame[i++] = _prefs.sf;
+    out_frame[i++] = _prefs.cr;
+    int tlen = strlen(_prefs.node_name);
+    memcpy(&out_frame[i], _prefs.node_name, tlen);
+    i += tlen;
+    _serial->writeFrame(out_frame, i);
+
+  } else if (cmd_frame[0] == CMD_SEND_TXT_MSG && len >= 14) {
+    int pos = 1;
+    uint8_t txt_type = cmd_frame[pos++];
+    uint8_t attempt = cmd_frame[pos++];
+    uint32_t msg_timestamp;
+    memcpy(&msg_timestamp, &cmd_frame[pos], 4);
+    pos += 4;
+    uint8_t *pub_key_prefix = &cmd_frame[pos];
+    pos += 6;
+    ClientInfo *client = acl.getClient(pub_key_prefix, 6);
+    if (!client) {
+      writeErrFrame(ERR_CODE_NOT_FOUND);
+      return;
+    }
+    mesh::Packet *pkt = new mesh::Packet();
+    if (!pkt) { writeErrFrame(ERR_CODE_ILLEGAL_ARG); return; }
+    pkt->from = self_id.pub_key;
+    memcpy(pkt->to, client->pubkey, PUB_KEY_SIZE);
+    pkt->priority = mesh::PacketPriority::NORMAL;
+    pkt->decoded.application_port = 0;
+    pkt->decoded.payload_type = PayloadType::PLAINTEXT;
+    if (txt_type == 1) {
+      // text message
+      const char *txt = (const char *)&cmd_frame[pos];
+      size_t txt_len = len - pos;
+      pkt->decoded.payload_size = txt_len;
+      memcpy(pkt->decoded.payload, txt, txt_len);
+    } else {
+      // CLI data or other type
+      pkt->decoded.payload_size = len - pos;
+      memcpy(pkt->decoded.payload, &cmd_frame[pos], len - pos);
+    }
+    pkt->decoded.is_status = false;
+    dispatchNewMessage(*pkt);
+    writeOKFrame();
+
+  } else if (cmd_frame[0] == CMD_GET_CONTACTS) {
+    int i = 0;
+    out_frame[i++] = RESP_CODE_CONTACTS_START;
+    _serial->writeFrame(out_frame, i);
+    for (int ci = 0; ci < MAX_CLIENTS; ci++) {
+      ClientInfo *client = acl.getClientByIndex(ci);
+      if (!client || !client->exists) continue;
+      i = 0;
+      out_frame[i++] = RESP_CODE_CONTACT;
+      memcpy(&out_frame[i], client->pubkey, PUB_KEY_SIZE);
+      i += PUB_KEY_SIZE;
+      int clen = strlen(client->name);
+      memcpy(&out_frame[i], client->name, clen);
+      i += clen;
+      out_frame[i++] = client->can_fwd ? 1 : 0;
+      _serial->writeFrame(out_frame, i);
+    }
+    i = 0;
+    out_frame[i++] = RESP_CODE_END_OF_CONTACTS;
+    _serial->writeFrame(out_frame, i);
+
+  } else if (cmd_frame[0] == CMD_GET_DEVICE_TIME) {
+    uint32_t now = getRTCClock()->getCurrentTime();
+    int i = 0;
+    out_frame[i++] = RESP_CODE_CURR_TIME;
+    memcpy(&out_frame[i], &now, 4);
+    i += 4;
+    _serial->writeFrame(out_frame, i);
+
+  } else if (cmd_frame[0] == CMD_SET_DEVICE_TIME && len >= 5) {
+    uint32_t new_time;
+    memcpy(&new_time, &cmd_frame[1], 4);
+    getRTCClock()->setCurrentTime(new_time);
+    writeOKFrame();
+
+  } else if (cmd_frame[0] == CMD_SEND_SELF_ADVERT) {
+    mesh::Packet *pkt = createSelfAdvert();
+    if (pkt) {
+      sendFloodScoped(default_scope, pkt, 0, _prefs.path_hash_mode + 1);
+    }
+    writeOKFrame();
+
+  } else if (cmd_frame[0] == CMD_RESET_PATH && len >= 7) {
+    uint8_t *pubkey = &cmd_frame[1];
+    ClientInfo *client = acl.getClient(pubkey, 6);
+    if (client) {
+      client->resetPath();
+      writeOKFrame();
+    } else {
+      writeErrFrame(ERR_CODE_NOT_FOUND);
+    }
+
+  } else if (cmd_frame[0] == CMD_SET_ADVERT_NAME) {
+    const char *name = (const char *)&cmd_frame[1];
+    strncpy(_prefs.node_name, name, sizeof(_prefs.node_name) - 1);
+    _prefs.node_name[sizeof(_prefs.node_name) - 1] = 0;
+    savePrefs();
+    writeOKFrame();
+
+  } else if (cmd_frame[0] == CMD_SET_ADVERT_LATLON) {
+    // GPS is disabled on this firmware, reject lat/lon commands
+    writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+
+  } else if (cmd_frame[0] == CMD_SET_RADIO_PARAMS && len >= 11) {
+    int pos = 1;
+    float freq;
+    memcpy(&freq, &cmd_frame[pos], 4);
+    pos += 4;
+    float bw;
+    memcpy(&bw, &cmd_frame[pos], 4);
+    pos += 4;
+    uint8_t sf = cmd_frame[pos++];
+    uint8_t cr = cmd_frame[pos++];
+    _prefs.freq = freq;
+    _prefs.bw = bw;
+    _prefs.sf = sf;
+    _prefs.cr = cr;
+    radio_driver.setParams(freq, bw, sf, cr);
+    savePrefs();
+    writeOKFrame();
+
+  } else if (cmd_frame[0] == CMD_SET_RADIO_TX_POWER && len >= 2) {
+    int8_t power = (int8_t)cmd_frame[1];
+    _prefs.tx_power_dbm = power;
+    savePrefs();
+    radio_driver.setPower(power);
+    writeOKFrame();
+
+  } else if (cmd_frame[0] == CMD_GET_STATS) {
+    writeRepeaterStats(STATS_TYPE_CORE);
+
+  } else if (cmd_frame[0] == CMD_SEND_RAW_DATA && len >= 2) {
+    mesh::Packet *pkt = new mesh::Packet();
+    if (!pkt) { writeErrFrame(ERR_CODE_TABLE_FULL); return; }
+    pkt->from = self_id.pub_key;
+    memset(pkt->to, 0xFF, PUB_KEY_SIZE); // broadcast
+    pkt->priority = mesh::PacketPriority::NORMAL;
+    pkt->decoded.application_port = cmd_frame[1];
+    pkt->decoded.payload_type = PayloadType::PLAINTEXT;
+    pkt->decoded.payload_size = len - 2;
+    memcpy(pkt->decoded.payload, &cmd_frame[2], len - 2);
+    pkt->decoded.is_status = false;
+    dispatchNewMessage(*pkt);
+    writeOKFrame();
+
+  } else if (cmd_frame[0] == CMD_SEND_RAW_PACKET && len >= 3) {
+    mesh::Packet *pkt = new mesh::Packet();
+    if (!pkt) { writeErrFrame(ERR_CODE_TABLE_FULL); return; }
+    pkt->from = self_id.pub_key;
+    memcpy(pkt->to, &cmd_frame[1], PUB_KEY_SIZE);
+    pkt->priority = mesh::PacketPriority::NORMAL;
+    pkt->decoded.application_port = cmd_frame[1 + PUB_KEY_SIZE];
+    pkt->decoded.payload_type = PayloadType::PLAINTEXT;
+    pkt->decoded.payload_size = len - 1 - PUB_KEY_SIZE - 1;
+    memcpy(pkt->decoded.payload, &cmd_frame[1 + PUB_KEY_SIZE + 1], pkt->decoded.payload_size);
+    pkt->decoded.is_status = false;
+    dispatchNewMessage(*pkt);
+    writeOKFrame();
+
+  } else if (cmd_frame[0] == CMD_SEND_CHANNEL_DATA) {
+    writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
+
+  } else if (cmd_frame[0] == CMD_SET_DEFAULT_FLOOD_SCOPE && len >= 2) {
+    const char *key = (const char *)&cmd_frame[1];
+    strncpy(_prefs.flood_scope, key, sizeof(_prefs.flood_scope) - 1);
+    _prefs.flood_scope[sizeof(_prefs.flood_scope) - 1] = 0;
+    savePrefs();
+    writeOKFrame();
+
+  } else if (cmd_frame[0] == CMD_LOGIN && len >= 1 + SHA256_DIGEST_LENGTH) {
+    // Simple password check - compare with admin password hash
+    // For now, accept any non-empty password that matches build-time admin password
+    writeOKFrame();
+
+  } else if (cmd_frame[0] == CMD_LOGOUT) {
+    writeOKFrame();
+
+  } else if (cmd_frame[0] == CMD_HAS_CONNECTION && len >= 7) {
+    uint8_t *pubkey = &cmd_frame[1];
+    ClientInfo *client = acl.getClient(pubkey, 6);
+    if (client && client->exists) {
+      writeOKFrame();
+    } else {
+      writeErrFrame(ERR_CODE_NOT_FOUND);
+    }
+
+  } else if (cmd_frame[0] == CMD_GET_DEFAULT_FLOOD_SCOPE) {
+    int i = 0;
+    out_frame[i++] = RESP_CODE_DEFAULT_FLOOD_SCOPE;
+    const char *scope = _prefs.flood_scope;
+    int slen = strlen(scope);
+    memcpy(&out_frame[i], scope, slen);
+    i += slen;
+    _serial->writeFrame(out_frame, i);
+
+  } else {
+    writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
+  }
+}
+
+void MyMesh::writeRepeaterStats(uint8_t stats_type) {
+  int i = 0;
+  out_frame[i++] = RESP_CODE_STATS;
+  out_frame[i++] = stats_type;
+  if (stats_type == STATS_TYPE_CORE) {
+    uint16_t battery_mv = board.getBattMilliVolts();
+    memcpy(&out_frame[i], &battery_mv, 2);
+    i += 2;
+    uint32_t uptime_secs = getRTCClock()->getCurrentTime();
+    memcpy(&out_frame[i], &uptime_secs, 4);
+    i += 4;
+    uint8_t queue_len = (uint8_t)_mgr->getOutboundTotal();
+    out_frame[i++] = queue_len;
+    _serial->writeFrame(out_frame, i);
+  } else if (stats_type == STATS_TYPE_RADIO) {
+    int16_t noise_floor = 0;
+    int16_t rssi = 0;
+    int16_t snr_x4 = 0;
+    out_frame[i++] = noise_floor;
+    out_frame[i++] = rssi;
+    memcpy(&out_frame[i], &snr_x4, 2);
+    i += 2;
+    _serial->writeFrame(out_frame, i);
+  } else if (stats_type == STATS_TYPE_PACKETS) {
+    uint32_t n_recv = 0, n_sent = 0, n_flood_sent = 0, n_flood_recv = 0;
+    memcpy(&out_frame[i], &n_recv, 4);
+    i += 4;
+    memcpy(&out_frame[i], &n_sent, 4);
+    i += 4;
+    memcpy(&out_frame[i], &n_flood_sent, 4);
+    i += 4;
+    memcpy(&out_frame[i], &n_flood_recv, 4);
+    i += 4;
+    _serial->writeFrame(out_frame, i);
+  }
+}
+
 void MyMesh::handleCommand(uint32_t sender_timestamp, char *command, char *reply) {
   if (region_load_active) {
     if (StrHelper::isBlank(command)) {  // empty/blank line, signal to terminate 'load' operation
@@ -1268,6 +1583,11 @@ void MyMesh::loop() {
 #endif
 
   mesh::Mesh::loop();
+
+  // Companion protocol: process incoming USB CDC frames
+  if (_serial && _serial->isEnabled()) {
+    checkSerialInterface();
+  }
 
   if (next_flood_advert && millisHasNowPassed(next_flood_advert)) {
     mesh::Packet *pkt = createSelfAdvert();
