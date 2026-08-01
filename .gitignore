@@ -17,3 +17,7 @@ compile_commands.json
 .venv/
 venv/
 platformio.local.ini
+*.zip
+*.uf2
+*.bin
+

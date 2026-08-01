@@ -1,5 +1,8 @@
 #include "MyMesh.h"
 #include <algorithm>
+#include <helpers/ChannelDetails.h>
+
+extern unsigned int decode_base64(const unsigned char input[], unsigned int input_length, unsigned char output[]);
 
 /* ------------------------------ Config -------------------------------- */
 
@@ -396,6 +399,26 @@ File MyMesh::openAppend(const char *fname) {
 #endif
 }
 
+File MyMesh::openRead(const char *fname) {
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  return _fs->open(fname, FILE_O_READ);
+#elif defined(RP2040_PLATFORM)
+  return _fs->open(fname, "r");
+#else
+  return _fs->open(fname, "r");
+#endif
+}
+
+File MyMesh::openWrite(const char *fname) {
+#if defined(NRF52_PLATFORM) || defined(STM32_PLATFORM)
+  return _fs->open(fname, FILE_O_WRITE);
+#elif defined(RP2040_PLATFORM)
+  return _fs->open(fname, "w");
+#else
+  return _fs->open(fname, "w");
+#endif
+}
+
 static uint8_t max_loop_minimal[] =  { 0, /* 1-byte */  4, /* 2-byte */  2, /* 3-byte */  1 };
 static uint8_t max_loop_moderate[] = { 0, /* 1-byte */  2, /* 2-byte */  1, /* 3-byte */  1 };
 static uint8_t max_loop_strict[] =   { 0, /* 1-byte */  1, /* 2-byte */  1, /* 3-byte */  1 };
@@ -464,6 +487,19 @@ const char *MyMesh::getLogDateTime() {
 }
 
 void MyMesh::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
+  // Emit RX_LOG_DATA (0x88) frame to companion host when serial is connected,
+  // mirroring the companion_radio implementation so the bot's RF correlator
+  // can populate recent_rf_data for channel messages.
+  if (_serial && _serial->isConnected() && len + 3 <= MAX_FRAME_SIZE) {
+    int i = 0;
+    out_frame[i++] = PUSH_CODE_LOG_RX_DATA;
+    out_frame[i++] = (int8_t)(snr * 4);
+    out_frame[i++] = (int8_t)(rssi);
+    memcpy(&out_frame[i], raw, len);
+    i += len;
+    _serial->writeFrame(out_frame, i);
+  }
+
 #if MESH_PACKET_LOGGING
   Serial.print(getLogDateTime());
   Serial.print(" RAW: ");
@@ -871,6 +907,9 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
 #if MAX_NEIGHBOURS
   memset(neighbours, 0, sizeof(neighbours));
 #endif
+#if MAX_GROUP_CHANNELS
+  _num_channels = 0;
+#endif
 
   // defaults
   memset(&_prefs, 0, sizeof(_prefs));
@@ -927,6 +966,7 @@ MyMesh::MyMesh(mesh::MainBoard &board, mesh::Radio &radio, mesh::MillisecondCloc
 void MyMesh::begin(FILESYSTEM *fs) {
   mesh::Mesh::begin();
   _fs = fs;
+  loadChannels();
   // load persisted prefs
   _cli.loadPrefs(_fs);
   acl.load(_fs, self_id);
@@ -1196,8 +1236,24 @@ void MyMesh::startInterface(BaseSerialInterface &serial) {
 }
 
 void MyMesh::checkSerialInterface() {
+  if (!_serial || !_serial->isConnected()) return;
+
+  // Flush any push notification queued from a mesh callback (IRQ context)
+  if (push_pending) {
+    push_pending = false;
+    if (!_serial->isWriteBusy()) {
+      uint8_t push[1] = {PUSH_CODE_MSG_WAITING};
+      _serial->writeFrame(push, 1);
+    } else {
+      // write is busy, re-queue for next poll
+      push_pending = true;
+    }
+  }
+
+  MESH_DEBUG_PRINTLN("checkSerialInterface: frame available");
   size_t len = _serial->checkRecvFrame(cmd_frame);
   if (len > 0) {
+    MESH_DEBUG_PRINTLN("handleCmdFrame: cmd=0x%02x len=%d", cmd_frame[0], (uint32_t)len);
     handleCmdFrame(len);
   }
 }
@@ -1240,6 +1296,8 @@ void MyMesh::handleCmdFrame(size_t len) {
     i += 4;
     out_frame[i++] = _prefs.multi_acks;
     out_frame[i++] = _prefs.advert_loc_policy;
+    out_frame[i++] = 0; // telemetry_mode (not supported on repeater)
+    out_frame[i++] = 0; // manual_add_contacts (not supported on repeater)
     uint32_t freq = _prefs.freq * 1000;
     memcpy(&out_frame[i], &freq, 4);
     i += 4;
@@ -1256,54 +1314,50 @@ void MyMesh::handleCmdFrame(size_t len) {
   } else if (cmd_frame[0] == CMD_SEND_TXT_MSG && len >= 14) {
     int pos = 1;
     uint8_t txt_type = cmd_frame[pos++];
+    (void)txt_type;
     uint8_t attempt = cmd_frame[pos++];
+    (void)attempt;
     uint32_t msg_timestamp;
     memcpy(&msg_timestamp, &cmd_frame[pos], 4);
     pos += 4;
-    uint8_t *pub_key_prefix = &cmd_frame[pos];
+    uint8_t *dest_hash = &cmd_frame[pos];
     pos += 6;
-    ClientInfo *client = acl.getClient(pub_key_prefix, 6);
+    const char *txt = (const char *)&cmd_frame[pos];
+    size_t txt_len = len - pos;
+    ClientInfo *client = acl.getClient(dest_hash, 6);
     if (!client) {
       writeErrFrame(ERR_CODE_NOT_FOUND);
       return;
     }
-    mesh::Packet *pkt = new mesh::Packet();
-    if (!pkt) { writeErrFrame(ERR_CODE_ILLEGAL_ARG); return; }
-    pkt->from = self_id.pub_key;
-    memcpy(pkt->to, client->pubkey, PUB_KEY_SIZE);
-    pkt->priority = mesh::PacketPriority::NORMAL;
-    pkt->decoded.application_port = 0;
-    pkt->decoded.payload_type = PayloadType::PLAINTEXT;
-    if (txt_type == 1) {
-      // text message
-      const char *txt = (const char *)&cmd_frame[pos];
-      size_t txt_len = len - pos;
-      pkt->decoded.payload_size = txt_len;
-      memcpy(pkt->decoded.payload, txt, txt_len);
-    } else {
-      // CLI data or other type
-      pkt->decoded.payload_size = len - pos;
-      memcpy(pkt->decoded.payload, &cmd_frame[pos], len - pos);
-    }
-    pkt->decoded.is_status = false;
-    dispatchNewMessage(*pkt);
+    mesh::Packet *pkt = createDatagram(PAYLOAD_TYPE_TXT_MSG, client->id, client->shared_secret, (const uint8_t *)txt, txt_len);
+    if (!pkt) { writeErrFrame(ERR_CODE_TABLE_FULL); return; }
+    sendFloodScoped(default_scope, pkt, 0, _prefs.path_hash_mode + 1);
     writeOKFrame();
 
   } else if (cmd_frame[0] == CMD_GET_CONTACTS) {
     int i = 0;
     out_frame[i++] = RESP_CODE_CONTACTS_START;
+    out_frame[i++] = acl.getNumClients() & 0xFF;
+    out_frame[i++] = (acl.getNumClients() >> 8) & 0xFF;
+    out_frame[i++] = 0; // padding
+    out_frame[i++] = 0; // padding
     _serial->writeFrame(out_frame, i);
-    for (int ci = 0; ci < MAX_CLIENTS; ci++) {
-      ClientInfo *client = acl.getClientByIndex(ci);
-      if (!client || !client->exists) continue;
+    for (int ci = 0; ci < acl.getNumClients(); ci++) {
+      ClientInfo *client = acl.getClientByIdx(ci);
+      if (!client) continue;
       i = 0;
       out_frame[i++] = RESP_CODE_CONTACT;
-      memcpy(&out_frame[i], client->pubkey, PUB_KEY_SIZE);
+      memcpy(&out_frame[i], client->id.pub_key, PUB_KEY_SIZE);
       i += PUB_KEY_SIZE;
-      int clen = strlen(client->name);
-      memcpy(&out_frame[i], client->name, clen);
-      i += clen;
-      out_frame[i++] = client->can_fwd ? 1 : 0;
+      out_frame[i++] = 0; // type
+      out_frame[i++] = 0; // flags
+      out_frame[i++] = 0; // plen (no out_path)
+      memset(&out_frame[i], 0, 64); // out_path
+      i += 64;
+      memset(&out_frame[i], 0, 32); // adv_name
+      i += 32;
+      memset(&out_frame[i], 0, 4); // last_advert
+      i += 4;
       _serial->writeFrame(out_frame, i);
     }
     i = 0;
@@ -1331,16 +1385,6 @@ void MyMesh::handleCmdFrame(size_t len) {
     }
     writeOKFrame();
 
-  } else if (cmd_frame[0] == CMD_RESET_PATH && len >= 7) {
-    uint8_t *pubkey = &cmd_frame[1];
-    ClientInfo *client = acl.getClient(pubkey, 6);
-    if (client) {
-      client->resetPath();
-      writeOKFrame();
-    } else {
-      writeErrFrame(ERR_CODE_NOT_FOUND);
-    }
-
   } else if (cmd_frame[0] == CMD_SET_ADVERT_NAME) {
     const char *name = (const char *)&cmd_frame[1];
     strncpy(_prefs.node_name, name, sizeof(_prefs.node_name) - 1);
@@ -1349,19 +1393,20 @@ void MyMesh::handleCmdFrame(size_t len) {
     writeOKFrame();
 
   } else if (cmd_frame[0] == CMD_SET_ADVERT_LATLON) {
-    // GPS is disabled on this firmware, reject lat/lon commands
     writeErrFrame(ERR_CODE_ILLEGAL_ARG);
 
   } else if (cmd_frame[0] == CMD_SET_RADIO_PARAMS && len >= 11) {
     int pos = 1;
-    float freq;
-    memcpy(&freq, &cmd_frame[pos], 4);
+    uint32_t freq_i;
+    memcpy(&freq_i, &cmd_frame[pos], 4);
     pos += 4;
-    float bw;
-    memcpy(&bw, &cmd_frame[pos], 4);
+    uint32_t bw_i;
+    memcpy(&bw_i, &cmd_frame[pos], 4);
     pos += 4;
     uint8_t sf = cmd_frame[pos++];
     uint8_t cr = cmd_frame[pos++];
+    float freq = freq_i / 1000.0f;
+    float bw = bw_i / 1000.0f;
     _prefs.freq = freq;
     _prefs.bw = bw;
     _prefs.sf = sf;
@@ -1374,53 +1419,55 @@ void MyMesh::handleCmdFrame(size_t len) {
     int8_t power = (int8_t)cmd_frame[1];
     _prefs.tx_power_dbm = power;
     savePrefs();
-    radio_driver.setPower(power);
+    radio_driver.setTxPower(power);
     writeOKFrame();
 
   } else if (cmd_frame[0] == CMD_GET_STATS) {
     writeRepeaterStats(STATS_TYPE_CORE);
 
   } else if (cmd_frame[0] == CMD_SEND_RAW_DATA && len >= 2) {
-    mesh::Packet *pkt = new mesh::Packet();
+    uint8_t port = cmd_frame[1];
+    const uint8_t *data = &cmd_frame[2];
+    size_t data_len = len - 2;
+    (void)port;
+    mesh::Packet *pkt = createDatagram(PAYLOAD_TYPE_REQ, self_id, (const uint8_t *)"", data, data_len);
     if (!pkt) { writeErrFrame(ERR_CODE_TABLE_FULL); return; }
-    pkt->from = self_id.pub_key;
-    memset(pkt->to, 0xFF, PUB_KEY_SIZE); // broadcast
-    pkt->priority = mesh::PacketPriority::NORMAL;
-    pkt->decoded.application_port = cmd_frame[1];
-    pkt->decoded.payload_type = PayloadType::PLAINTEXT;
-    pkt->decoded.payload_size = len - 2;
-    memcpy(pkt->decoded.payload, &cmd_frame[2], len - 2);
-    pkt->decoded.is_status = false;
-    dispatchNewMessage(*pkt);
+    sendFloodScoped(default_scope, pkt, 0, _prefs.path_hash_mode + 1);
     writeOKFrame();
 
-  } else if (cmd_frame[0] == CMD_SEND_RAW_PACKET && len >= 3) {
-    mesh::Packet *pkt = new mesh::Packet();
+  } else if (cmd_frame[0] == CMD_SEND_RAW_PACKET && len >= 1 + PUB_KEY_SIZE + 1) {
+    mesh::Identity dest;
+    memset(&dest, 0, sizeof(dest));
+    memcpy(dest.pub_key, &cmd_frame[1], PUB_KEY_SIZE);
+    uint8_t port = cmd_frame[1 + PUB_KEY_SIZE];
+    const uint8_t *data = &cmd_frame[1 + PUB_KEY_SIZE + 1];
+    size_t data_len = len - (1 + PUB_KEY_SIZE + 1);
+    (void)port;
+    mesh::Packet *pkt = createDatagram(PAYLOAD_TYPE_REQ, dest, (const uint8_t *)"", data, data_len);
     if (!pkt) { writeErrFrame(ERR_CODE_TABLE_FULL); return; }
-    pkt->from = self_id.pub_key;
-    memcpy(pkt->to, &cmd_frame[1], PUB_KEY_SIZE);
-    pkt->priority = mesh::PacketPriority::NORMAL;
-    pkt->decoded.application_port = cmd_frame[1 + PUB_KEY_SIZE];
-    pkt->decoded.payload_type = PayloadType::PLAINTEXT;
-    pkt->decoded.payload_size = len - 1 - PUB_KEY_SIZE - 1;
-    memcpy(pkt->decoded.payload, &cmd_frame[1 + PUB_KEY_SIZE + 1], pkt->decoded.payload_size);
-    pkt->decoded.is_status = false;
-    dispatchNewMessage(*pkt);
+     sendFloodScoped(default_scope, pkt, 0, _prefs.path_hash_mode + 1);
+     writeOKFrame();
+
+  } else if (cmd_frame[0] == CMD_SEND_CHANNEL_TXT_MSG && len >= 7) {
+    int pos = 1;
+    uint8_t txt_type = cmd_frame[pos++];
+    (void)txt_type;
+    uint8_t channel_idx = cmd_frame[pos++];
+    uint32_t msg_timestamp;
+    memcpy(&msg_timestamp, &cmd_frame[pos], 4);
+    pos += 4;
+    const char *msg = (const char *)&cmd_frame[pos];
+    size_t msg_len = len - pos;
+    sendChannelTextMsg(channel_idx, msg_timestamp, msg, msg_len);
     writeOKFrame();
 
   } else if (cmd_frame[0] == CMD_SEND_CHANNEL_DATA) {
     writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
 
-  } else if (cmd_frame[0] == CMD_SET_DEFAULT_FLOOD_SCOPE && len >= 2) {
-    const char *key = (const char *)&cmd_frame[1];
-    strncpy(_prefs.flood_scope, key, sizeof(_prefs.flood_scope) - 1);
-    _prefs.flood_scope[sizeof(_prefs.flood_scope) - 1] = 0;
-    savePrefs();
-    writeOKFrame();
+  } else if (cmd_frame[0] == CMD_SET_DEFAULT_FLOOD_SCOPE) {
+    writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
 
-  } else if (cmd_frame[0] == CMD_LOGIN && len >= 1 + SHA256_DIGEST_LENGTH) {
-    // Simple password check - compare with admin password hash
-    // For now, accept any non-empty password that matches build-time admin password
+  } else if (cmd_frame[0] == CMD_LOGIN) {
     writeOKFrame();
 
   } else if (cmd_frame[0] == CMD_LOGOUT) {
@@ -1429,21 +1476,67 @@ void MyMesh::handleCmdFrame(size_t len) {
   } else if (cmd_frame[0] == CMD_HAS_CONNECTION && len >= 7) {
     uint8_t *pubkey = &cmd_frame[1];
     ClientInfo *client = acl.getClient(pubkey, 6);
-    if (client && client->exists) {
+    if (client) {
       writeOKFrame();
     } else {
       writeErrFrame(ERR_CODE_NOT_FOUND);
     }
 
   } else if (cmd_frame[0] == CMD_GET_DEFAULT_FLOOD_SCOPE) {
-    int i = 0;
-    out_frame[i++] = RESP_CODE_DEFAULT_FLOOD_SCOPE;
-    const char *scope = _prefs.flood_scope;
-    int slen = strlen(scope);
-    memcpy(&out_frame[i], scope, slen);
-    i += slen;
-    _serial->writeFrame(out_frame, i);
+    writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
 
+  } else if (cmd_frame[0] == CMD_GET_CHANNEL && len >= 2) {
+#if MAX_GROUP_CHANNELS
+    uint8_t channel_idx = cmd_frame[1];
+    if (channel_idx < _num_channels) {
+      int i = 0;
+      out_frame[i++] = RESP_CODE_CHANNEL_INFO;
+      out_frame[i++] = channel_idx;
+      memcpy(&out_frame[i], _channels[channel_idx].name, 32);
+      i += 32;
+      memcpy(&out_frame[i], _channels[channel_idx].channel.secret, 16);
+      i += 16;
+      _serial->writeFrame(out_frame, i);
+    } else {
+      writeErrFrame(ERR_CODE_NOT_FOUND);
+    }
+#else
+    writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
+#endif
+  } else if (cmd_frame[0] == CMD_SET_CHANNEL && len >= 2 + 32 + 16) {
+#if MAX_GROUP_CHANNELS
+    uint8_t channel_idx = cmd_frame[1];
+    ChannelDetails ch;
+    strncpy(ch.name, (const char*)&cmd_frame[2], sizeof(ch.name) - 1);
+    ch.name[sizeof(ch.name) - 1] = 0;
+    memset(ch.channel.secret, 0, sizeof(ch.channel.secret));
+    memcpy(ch.channel.secret, &cmd_frame[2 + 32], 16);
+    if (setChannel(channel_idx, ch)) {
+      saveChannels();
+      writeOKFrame();
+    } else {
+      writeErrFrame(ERR_CODE_NOT_FOUND);
+    }
+#else
+    writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
+#endif
+  } else if (cmd_frame[0] == CMD_SYNC_NEXT_MESSAGE) {
+    int out_len;
+    if ((out_len = getFromOfflineQueue(out_frame)) > 0) {
+      if (!_serial->isWriteBusy()) {
+        _serial->writeFrame(out_frame, out_len);
+      } else {
+        // queue the response for later - retry when USB not busy
+        addToOfflineQueue(out_frame, out_len);
+      }
+    } else {
+      out_frame[0] = RESP_CODE_NO_MORE_MESSAGES;
+      if (!_serial->isWriteBusy()) {
+        _serial->writeFrame(out_frame, 1);
+      } else {
+        addToOfflineQueue(out_frame, 1);
+      }
+    }
   } else {
     writeErrFrame(ERR_CODE_UNSUPPORTED_CMD);
   }
@@ -1460,28 +1553,32 @@ void MyMesh::writeRepeaterStats(uint8_t stats_type) {
     uint32_t uptime_secs = getRTCClock()->getCurrentTime();
     memcpy(&out_frame[i], &uptime_secs, 4);
     i += 4;
+    memcpy(&out_frame[i], &_err_flags, 2);
+    i += 2;
     uint8_t queue_len = (uint8_t)_mgr->getOutboundTotal();
     out_frame[i++] = queue_len;
     _serial->writeFrame(out_frame, i);
   } else if (stats_type == STATS_TYPE_RADIO) {
     int16_t noise_floor = 0;
-    int16_t rssi = 0;
-    int16_t snr_x4 = 0;
-    out_frame[i++] = noise_floor;
-    out_frame[i++] = rssi;
-    memcpy(&out_frame[i], &snr_x4, 2);
+    memcpy(&out_frame[i], &noise_floor, 2);
     i += 2;
+    int8_t last_rssi = 0;
+    out_frame[i++] = last_rssi;
+    int8_t last_snr = 0;
+    out_frame[i++] = last_snr;
+    uint32_t tx_air_secs = 0;
+    memcpy(&out_frame[i], &tx_air_secs, 4);
+    i += 4;
+    uint32_t rx_air_secs = 0;
+    memcpy(&out_frame[i], &rx_air_secs, 4);
+    i += 4;
     _serial->writeFrame(out_frame, i);
   } else if (stats_type == STATS_TYPE_PACKETS) {
     uint32_t n_recv = 0, n_sent = 0, n_flood_sent = 0, n_flood_recv = 0;
-    memcpy(&out_frame[i], &n_recv, 4);
-    i += 4;
-    memcpy(&out_frame[i], &n_sent, 4);
-    i += 4;
-    memcpy(&out_frame[i], &n_flood_sent, 4);
-    i += 4;
-    memcpy(&out_frame[i], &n_flood_recv, 4);
-    i += 4;
+    memcpy(&out_frame[i], &n_recv, 4); i += 4;
+    memcpy(&out_frame[i], &n_sent, 4); i += 4;
+    memcpy(&out_frame[i], &n_flood_sent, 4); i += 4;
+    memcpy(&out_frame[i], &n_flood_recv, 4); i += 4;
     _serial->writeFrame(out_frame, i);
   }
 }
@@ -1633,4 +1730,225 @@ bool MyMesh::hasPendingWork() const {
   if (bridge.isRunning()) return true;  // bridge needs WiFi radio, can't sleep
 #endif
   return _mgr->getOutboundTotal() > 0;
+}
+
+// Channel support methods
+bool MyMesh::addChannel(const char* name, const char* psk_base64) {
+#if MAX_GROUP_CHANNELS
+  if (_num_channels < MAX_GROUP_CHANNELS) {
+    auto dest = &_channels[_num_channels];
+    memset(dest->channel.secret, 0, sizeof(dest->channel.secret));
+    int len = decode_base64((unsigned char *) psk_base64, strlen(psk_base64), dest->channel.secret);
+    if (len == 32 || len == 16) {
+      mesh::Utils::sha256(dest->channel.hash, sizeof(dest->channel.hash), dest->channel.secret, len);
+      strncpy(dest->name, name, sizeof(dest->name) - 1);
+      dest->name[sizeof(dest->name) - 1] = 0;
+      _num_channels++;
+      return true;
+    }
+  }
+#endif
+  return false;
+}
+
+bool MyMesh::getChannel(uint8_t idx, mesh::GroupChannel& dest) {
+#if MAX_GROUP_CHANNELS
+  if (idx < _num_channels) {
+    dest = _channels[idx].channel;
+    return true;
+  }
+#endif
+  return false;
+}
+
+mesh::GroupChannel* MyMesh::findChannelByHash(const uint8_t* hash) {
+#if MAX_GROUP_CHANNELS
+  for (int i = 0; i < _num_channels; i++) {
+    if (memcmp(_channels[i].channel.hash, hash, sizeof(mesh::GroupChannel::hash)) == 0) {
+      return &_channels[i].channel;
+    }
+  }
+#endif
+  return NULL;
+}
+
+void MyMesh::relayGroupData(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel, uint8_t* data, size_t len) {
+  (void)channel;
+  (void)data;
+  (void)len;
+  if (type == PAYLOAD_TYPE_GRP_TXT || type == PAYLOAD_TYPE_GRP_DATA) {
+    sendFlood(packet, (uint32_t)0, _prefs.path_hash_mode + 1);
+  }
+}
+
+void MyMesh::sendChannelTextMsg(uint8_t channel_idx, uint32_t timestamp, const char* msg, size_t msg_len) {
+#if MAX_GROUP_CHANNELS
+  mesh::GroupChannel channel;
+  if (!getChannel(channel_idx, channel)) {
+    return;
+  }
+
+  uint8_t temp[MAX_PACKET_PAYLOAD];
+  memcpy(temp, &timestamp, 4);
+  temp[4] = TXT_TYPE_PLAIN;
+
+  int prefix_len = sprintf((char*)&temp[5], "%s: ", _prefs.node_name);
+  if (msg_len + prefix_len > MAX_PACKET_PAYLOAD - 5) msg_len = MAX_PACKET_PAYLOAD - 5 - prefix_len;
+  memcpy(&temp[5 + prefix_len], msg, msg_len);
+
+  mesh::Packet* pkt = createGroupDatagram(PAYLOAD_TYPE_GRP_TXT, channel, temp, 5 + prefix_len + msg_len);
+  if (pkt) {
+    sendFlood(pkt, (uint32_t)0, _prefs.path_hash_mode + 1);
+  }
+#endif
+}
+
+uint8_t MyMesh::findChannelIdx(const mesh::GroupChannel& ch) {
+#if MAX_GROUP_CHANNELS
+  for (uint8_t i = 0; i < _num_channels; i++) {
+    if (memcmp(ch.secret, _channels[i].channel.secret, sizeof(ch.secret)) == 0) return i;
+  }
+#endif
+  return 0xFF;
+}
+
+bool MyMesh::setChannel(uint8_t idx, const ChannelDetails& src) {
+#if MAX_GROUP_CHANNELS
+  if (idx < MAX_GROUP_CHANNELS) {
+    _channels[idx] = src;
+    static const uint8_t zeroes[16] = {0};
+    if (memcmp(&src.channel.secret[16], zeroes, 16) == 0) {
+      mesh::Utils::sha256(_channels[idx].channel.hash, sizeof(mesh::GroupChannel::hash), src.channel.secret, 16);
+    } else {
+      mesh::Utils::sha256(_channels[idx].channel.hash, sizeof(mesh::GroupChannel::hash), src.channel.secret, 32);
+    }
+    if (idx >= _num_channels) {
+      _num_channels = idx + 1;
+    }
+    return true;
+  }
+#endif
+  return false;
+}
+
+void MyMesh::saveChannels() {
+#if MAX_GROUP_CHANNELS
+  File file = openWrite("/channels2");
+  if (file) {
+    uint8_t unused[4] = {0};
+    for (uint8_t i = 0; i < _num_channels; i++) {
+      file.write(unused, 4);
+      file.write((uint8_t*)_channels[i].name, 32);
+      file.write((uint8_t*)_channels[i].channel.secret, 32);
+    }
+    file.close();
+  }
+#endif
+}
+
+void MyMesh::loadChannels() {
+#if MAX_GROUP_CHANNELS
+  File file = openRead("/channels2");
+  if (file) {
+    uint8_t channel_idx = 0;
+    while (channel_idx < MAX_GROUP_CHANNELS) {
+      ChannelDetails ch;
+      uint8_t unused[4];
+      if (file.read(unused, 4) != 4) break;
+      if (file.read((uint8_t*)ch.name, 32) != 32) break;
+      if (file.read((uint8_t*)ch.channel.secret, 32) != 32) break;
+      if (!setChannel(channel_idx, ch)) break;
+      channel_idx++;
+    }
+    file.close();
+    _num_channels = channel_idx;
+  }
+#endif
+}
+
+int MyMesh::searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channels[], int max_matches) {
+#if MAX_GROUP_CHANNELS
+  int n = 0;
+  for (int i = 0; i < _num_channels && n < max_matches; i++) {
+    if (memcmp(_channels[i].channel.hash, hash, sizeof(mesh::GroupChannel::hash)) == 0) {
+      channels[n++] = _channels[i].channel;
+    }
+  }
+  return n;
+#else
+  return 0;
+#endif
+}
+
+void MyMesh::addToOfflineQueue(const uint8_t frame[], int len) {
+  if (offline_queue_len < OFFLINE_QUEUE_SIZE) {
+    offline_queue[offline_queue_len].len = len;
+    memcpy(offline_queue[offline_queue_len].buf, frame, len);
+    offline_queue_len++;
+  } else {
+    MESH_DEBUG_PRINTLN("WARN: offline_queue is full!");
+  }
+}
+
+int MyMesh::getFromOfflineQueue(uint8_t frame[]) {
+  if (offline_queue_len > 0) {
+    int len = offline_queue[0].len;
+    memcpy(frame, offline_queue[0].buf, len);
+    offline_queue_len--;
+    for (int i = 0; i < offline_queue_len; i++) {
+      offline_queue[i] = offline_queue[i + 1];
+    }
+    return len;
+  }
+  return 0;
+}
+
+void MyMesh::onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel, uint8_t* data, size_t len) {
+#if MAX_GROUP_CHANNELS
+  if (type == PAYLOAD_TYPE_GRP_TXT) {
+    if (len < 5) {
+      MESH_DEBUG_PRINTLN("onGroupDataRecv: dropping short group text payload len=%d", (uint32_t)len);
+      return;
+    }
+    uint8_t txt_type = data[4];
+    if ((txt_type >> 2) != 0) {
+      MESH_DEBUG_PRINTLN("onGroupDataRecv: dropping unsupported group text type=%d", (uint32_t)txt_type);
+      return;
+    }
+    uint32_t timestamp;
+    memcpy(&timestamp, data, 4);
+    char text_buf[MAX_PACKET_PAYLOAD + 1];
+    size_t tlen = len - 5;
+    if (tlen > sizeof(text_buf) - 1) tlen = sizeof(text_buf) - 1;
+    memcpy(text_buf, &data[5], tlen);
+    text_buf[tlen] = 0;
+    tlen = strlen(text_buf);  // trim trailing nulls from raw payload
+
+    uint8_t channel_idx = findChannelIdx(channel);
+
+    int i = 0;
+    out_frame[i++] = RESP_CODE_CHANNEL_MSG_RECV_V3;
+    out_frame[i++] = (int8_t)(packet->getSNR() * 4);
+    out_frame[i++] = 0;
+    out_frame[i++] = 0;
+    out_frame[i++] = channel_idx;
+    out_frame[i++] = packet->isRouteFlood() ? packet->path_len : 0xFF;
+    out_frame[i++] = TXT_TYPE_PLAIN;
+    memcpy(&out_frame[i], &timestamp, 4);
+    i += 4;
+    if (i + tlen > MAX_FRAME_SIZE) tlen = MAX_FRAME_SIZE - i;
+    memcpy(&out_frame[i], text_buf, tlen);
+    i += tlen;
+
+    addToOfflineQueue(out_frame, i);
+
+    // Queue push notification instead of writing directly from IRQ context
+    // to avoid destabilizing USB CDC stack
+    push_pending = true;
+  } else if (type == PAYLOAD_TYPE_GRP_DATA) {
+    MESH_DEBUG_PRINTLN("onGroupDataRecv: GRP_DATA not queued (unsupported)");
+  }
+#else
+  (void)packet; (void)type; (void)channel; (void)data; (void)len;
+#endif
 }

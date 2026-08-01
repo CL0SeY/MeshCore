@@ -25,6 +25,7 @@
 
 #include <helpers/AdvertDataHelpers.h>
 #include <helpers/ArduinoHelpers.h>
+#include <helpers/ChannelDetails.h>
 #include <helpers/ClientACL.h>
 #include <helpers/CommonCLI.h>
 #include <helpers/BaseSerialInterface.h>
@@ -120,6 +121,16 @@ struct NeighbourInfo {
 #define RESP_CODE_DISABLED            15
 #define RESP_CODE_STATS               24
 #define RESP_CODE_DEFAULT_FLOOD_SCOPE 28
+#define CMD_GET_CHANNEL               31
+#define CMD_SET_CHANNEL               32
+#define CMD_SYNC_NEXT_MESSAGE         10
+#define RESP_CODE_CHANNEL_INFO        18
+#define RESP_CODE_CHANNEL_MSG_RECV_V3 17
+#define PUSH_CODE_MSG_WAITING         0x83
+#define PUSH_CODE_LOG_RX_DATA         0x88
+#ifndef OFFLINE_QUEUE_SIZE
+  #define OFFLINE_QUEUE_SIZE 16
+#endif
 
 // Error codes
 #define ERR_CODE_UNSUPPORTED_CMD      1
@@ -177,7 +188,17 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   BaseSerialInterface* _serial;
   uint8_t cmd_frame[MAX_FRAME_SIZE + 1];
   uint8_t out_frame[MAX_FRAME_SIZE + 1];
-
+#if MAX_GROUP_CHANNELS
+  ChannelDetails _channels[MAX_GROUP_CHANNELS];
+  uint8_t _num_channels;
+#endif
+  struct Frame {
+    uint8_t len;
+    uint8_t buf[MAX_FRAME_SIZE];
+  };
+  Frame offline_queue[OFFLINE_QUEUE_SIZE];
+  int offline_queue_len = 0;
+  bool push_pending = false;
   void putNeighbour(const mesh::Identity& id, uint32_t timestamp, float snr);
   uint8_t handleLoginReq(const mesh::Identity& sender, const uint8_t* secret, uint32_t sender_timestamp, const uint8_t* data, bool is_flood);
   uint8_t handleAnonRegionsReq(const mesh::Identity& sender, uint32_t sender_timestamp, const uint8_t* data);
@@ -187,6 +208,8 @@ class MyMesh : public mesh::Mesh, public CommonCLICallbacks {
   mesh::Packet* createSelfAdvert();
 
   File openAppend(const char* fname);
+  File openRead(const char* fname);
+  File openWrite(const char* fname);
   bool isLooped(const mesh::Packet* packet, const uint8_t max_counters[]);
 
 protected:
@@ -226,11 +249,14 @@ protected:
 
   void onAnonDataRecv(mesh::Packet* packet, const uint8_t* secret, const mesh::Identity& sender, uint8_t* data, size_t len) override;
   int searchPeersByHash(const uint8_t* hash) override;
+  int searchChannelsByHash(const uint8_t* hash, mesh::GroupChannel channels[], int max_matches) override;
   void getPeerSharedSecret(uint8_t* dest_secret, int peer_idx) override;
   void onAdvertRecv(mesh::Packet* packet, const mesh::Identity& id, uint32_t timestamp, const uint8_t* app_data, size_t app_data_len);
   void onPeerDataRecv(mesh::Packet* packet, uint8_t type, int sender_idx, const uint8_t* secret, uint8_t* data, size_t len) override;
   bool onPeerPathRecv(mesh::Packet* packet, int sender_idx, const uint8_t* secret, uint8_t* path, uint8_t path_len, uint8_t extra_type, uint8_t* extra, uint8_t extra_len) override;
   void onControlDataRecv(mesh::Packet* packet) override;
+
+  void onGroupDataRecv(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel, uint8_t* data, size_t len) override;
 
   void sendFloodReply(mesh::Packet* packet, unsigned long delay_millis, uint8_t path_hash_size);
 
@@ -293,6 +319,19 @@ public:
   void writeErrFrame(uint8_t err_code);
   void writeDisabledFrame();
   void writeRepeaterStats(uint8_t stats_type);
+
+  // Channel support
+  bool addChannel(const char* name, const char* psk_base64);
+  bool getChannel(uint8_t idx, mesh::GroupChannel& dest);
+  mesh::GroupChannel* findChannelByHash(const uint8_t* hash);
+  void relayGroupData(mesh::Packet* packet, uint8_t type, const mesh::GroupChannel& channel, uint8_t* data, size_t len);
+  void sendChannelTextMsg(uint8_t channel_idx, uint32_t timestamp, const char* msg, size_t msg_len);
+  void addToOfflineQueue(const uint8_t frame[], int len);
+  int getFromOfflineQueue(uint8_t frame[]);
+  uint8_t findChannelIdx(const mesh::GroupChannel& ch);
+  bool setChannel(uint8_t idx, const ChannelDetails& src);
+  void saveChannels();
+  void loadChannels();
 
 #if defined(WITH_BRIDGE)
   void setBridgeState(bool enable) override {
