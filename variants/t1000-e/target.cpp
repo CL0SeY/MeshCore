@@ -158,7 +158,7 @@ void T1000SensorManager::loop() {
       node_altitude = ((double)_nmea->getAltitude()) / 1000.0;
       //Serial.printf("lat %f lon %f\r\n", _lat, _lon);
     }
-    next_gps_update = millis() + 1000;
+    next_gps_update = millis() + (gps_update_interval_sec * 1000);
   }
 }
 
@@ -180,6 +180,12 @@ bool T1000SensorManager::setSettingValue(const char* name, const char* value) {
     } else {
       start_gps();
     }
+    return true;
+  }
+  if (strcmp(name, "gps_interval") == 0) {
+    uint32_t interval_seconds = atoi(value);
+    gps_update_interval_sec = interval_seconds > 0 ? interval_seconds : 1;
+    if (gps_update_interval_sec > 86400) gps_update_interval_sec = 86400;
     return true;
   }
   return false;  // not supported

@@ -204,6 +204,18 @@ private:
   void checkSerialInterface();
   bool isValidClientRepeatFreq(uint32_t f) const;
 
+  // GPS lease manager (firmware-side !gps handling — saves watch wakes).
+  // A "renewable" lease (!gps on) is refreshed by each LOC telemetry poll
+  // from that requester and expires 5 min after the last poll; a fixed
+  // lease (!gps N) keeps its explicit window and is never poll-refreshed.
+  struct GpsLease { uint8_t prefix[7]; uint32_t endsAt; bool used; bool renewable; char name[24]; };
+  static const int MAX_GPS_LEASES = 4;
+  static const uint32_t GPS_POLL_RENEW_MS = 5UL * 60UL * 1000UL;
+  GpsLease gpsLeases[MAX_GPS_LEASES] = {};
+  bool handleGpsTrigger(const ContactInfo &from, const char *text);
+  void reconcileGpsFromLeases();
+  void updateGpsLeases();
+
   // helpers, short-cuts
   void saveChannels() { _store->saveChannels(this); }
   void saveContacts();
