@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include "target.h"
 #include <helpers/sensors/MicroNMEALocationProvider.h>
+#include <helpers/sensors/GpsTelemetry.h>
 
 MeshTrackerX1Board board;
 
@@ -84,6 +85,7 @@ bool MeshTrackerX1SensorManager::begin() {
 bool MeshTrackerX1SensorManager::querySensors(uint8_t requester_permissions, CayenneLPP& telemetry) {
   if (requester_permissions & TELEM_PERM_LOCATION) {   // does requester have permission?
     telemetry.addGPS(TELEM_CHANNEL_SELF, node_lat, node_lon, node_altitude);
+    addGpsFixTelemetry(telemetry, _nmea, gps_active);
   }
   if (requester_permissions & TELEM_PERM_ENVIRONMENT && baro_ok) {
     telemetry.addTemperature(TELEM_CHANNEL_SELF, spa06.readTemperature());

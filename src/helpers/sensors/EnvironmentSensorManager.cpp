@@ -1,4 +1,5 @@
 #include "EnvironmentSensorManager.h"
+#include <helpers/sensors/GpsTelemetry.h>
 
 #include <Wire.h>
 
@@ -201,6 +202,7 @@ public:
       _sats = ublox_GNSS.getSIV(2);
     } else {
       _fix = false;
+      _sats = 0;   // a count from the last fix would misreport current GNSS health
     }
     _epoch = ublox_GNSS.getUnixEpoch(2);
   }
@@ -669,6 +671,9 @@ bool EnvironmentSensorManager::querySensors(uint8_t requester_permissions, Cayen
 
   if (requester_permissions & TELEM_PERM_LOCATION && gps_active) {
     telemetry.addGPS(TELEM_CHANNEL_SELF, node_lat, node_lon, node_altitude);
+    #if ENV_INCLUDE_GPS
+    addGpsFixTelemetry(telemetry, _location, gps_active);
+    #endif
   }
 
   if (requester_permissions & TELEM_PERM_ENVIRONMENT) {

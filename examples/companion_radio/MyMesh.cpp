@@ -1759,6 +1759,7 @@ void MyMesh::handleCmdFrame(size_t len) {
     memcpy(&out_frame[i], self_id.pub_key, 6);
     i += 6; // pub_key_prefix
     uint8_t tlen = telemetry.getSize();
+    if (i + tlen > MAX_FRAME_SIZE) tlen = MAX_FRAME_SIZE - i;
     memcpy(&out_frame[i], telemetry.getBuffer(), tlen);
     i += tlen;
     _serial->writeFrame(out_frame, i);

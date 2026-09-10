@@ -2,6 +2,7 @@
 #include "t1000e_sensors.h"
 #include "target.h"
 #include <helpers/sensors/MicroNMEALocationProvider.h>
+#include <helpers/sensors/GpsTelemetry.h>
 
 T1000eBoard board;
 
@@ -137,6 +138,7 @@ bool T1000SensorManager::begin() {
 bool T1000SensorManager::querySensors(uint8_t requester_permissions, CayenneLPP& telemetry) {
   if (requester_permissions & TELEM_PERM_LOCATION) {   // does requester have permission?
     telemetry.addGPS(TELEM_CHANNEL_SELF, node_lat, node_lon, node_altitude);
+    addGpsFixTelemetry(telemetry, _nmea, gps_active);
   }
   if (requester_permissions & TELEM_PERM_ENVIRONMENT) {
     // Firmware reports light as a 0-100 % scale, but expose it via Luminosity so app labels it "Luminosity".
