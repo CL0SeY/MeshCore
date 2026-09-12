@@ -642,6 +642,54 @@ Byte values are authoritative; names are aliases. When reading firmware source, 
 | 0x82  | PACKET_ACK                 | Acknowledgment                |
 | 0x83  | PACKET_MESSAGES_WAITING    | Messages waiting notification |
 | 0x88  | PACKET_LOG_DATA            | RF log data (can be ignored)  |
+| 0x8B  | PACKET_TELEMETRY_RESPONSE  | Self or contact telemetry push |
+
+### Telemetry Payload (CayenneLPP)
+
+The telemetry response (`PACKET_TELEMETRY_RESPONSE`, 0x8B) carries a
+CayenneLPP-encoded payload describing the node's own state. The same LPP
+layout is used by contact-request replies (0x03) and by the self-telemetry
+push (CMD_SEND_TELEMETRY_REQ).  Multi-byte LPP values are **big-endian**;
+the protocol's own framing is little-endian.
+
+Channel 1 (`TELEM_CHANNEL_SELF`) entries in fixed order, as added by the
+firmware's `querySensors` path:
+
+| Type     | ID   | Data size | Description                               |
+|----------|------|-----------|-------------------------------------------|
+| Voltage  | 0x74 | 2 B       | Battery voltage × 100                     |
+| GPS      | 0x88 | 9 B       | lat (3 B, ×10000°), lon, alt              |
+| UnixTime | 0x85 | 4 B       | Provider fix time, seconds since epoch     |
+| GenSensor| 0x64 | 4 B       | `sats × 10⁶ + HHMMSS` (UTC), big-endian uint32 |
+
+The remaining channels (2+) hold per-board environment sensor entries
+(temperature, humidity, pressure, etc.) in whatever order the board's
+active sensors were initialized.
+
+**0x85 semantics.** The unix-time stamp is the `LocationProvider::getTimestamp()`
+value of the provider's most recent valid GNSS fix (synced from NMEA when the
+fix has held for >2 s, or from the u-blox epoch). It is emitted **only** when
+the provider reports a valid fix **and** the clock value passes a lower-bound
+plausibility check (≥ 2020-01-01). An absent 0x85 means either the provider
+had no fix at emit time, the clock was implausible, the firmware predates this
+feature, or the GPS is asleep. The coordinate row (0x88) is emitted without
+this gate and may carry a `CMD_SET_ADVERT_LATLON` override for up to one GPS
+update interval after the override is set — during that window 0x85 (if
+present) timestamps the live provider fix, not necessarily the override
+coordinates.
+
+**0x64 semantics.** One packed value carrying both facts: satellite count in
+the high digits, fix wall clock (UTC) in the low six — e.g. `12170330` = 12
+sats at 17:03:30. Decode `sats = value / 1000000`, `clock = value % 1000000`;
+the clock is 0..235959 so it never carries into the count, and a clock of 0
+means either 00:00:00 or no plausible fix. Encoded as a big-endian **uint32**
+even though the call site passes a `float` to `addGenericSensor` — the library
+writes the raw integer bytes (multiplier 1), so decoders must read uint32, not
+float bits. Emitted whenever GPS is active, and also while asleep when a
+cached fix exists (count reads 0 then); absent on GPS-less sleep with no
+cached fix or on older firmware. One entry rather than two because UIs that
+key LPP by `(channel, type)` collapse duplicates. Full encoding and
+board-difference notes: `docs/m2-gps-fix-telemetry.md`.
 
 ### Parsing Responses
 

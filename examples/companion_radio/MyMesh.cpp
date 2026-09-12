@@ -524,6 +524,7 @@ void MyMesh::sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pk
 
 void MyMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp,
                            const char *text) {
+  if (handleGpsTrigger(from, text)) return;
   markConnectionActive(from); // in case this is from a server, and we have a connection
   queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, text);
 }
@@ -536,11 +537,105 @@ void MyMesh::onCommandDataRecv(const ContactInfo &from, mesh::Packet *pkt, uint3
 
 void MyMesh::onSignedMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp,
                                  const uint8_t *sender_prefix, const char *text) {
+  if (handleGpsTrigger(from, text)) {
+    markConnectionActive(from);
+    dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
+    return;
+  }
   markConnectionActive(from);
   // from.sync_since change needs to be persisted
   dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
   queueMessage(from, TXT_TYPE_SIGNED_PLAIN, pkt, sender_timestamp, sender_prefix, 4, text);
 }
+
+bool MyMesh::handleGpsTrigger(const ContactInfo &from, const char *text) {
+  if (!text) return false;
+  while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') text++;
+  bool isOff = strcasecmp(text, "!gps off") == 0;
+  bool isOn = strcasecmp(text, "!gps on") == 0;
+  int minutes = 0;
+  if (!isOff && !isOn) {
+    if (strncasecmp(text, "!gps", 4) != 0) return false;
+    const char *p = text + 4;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '\0') return false;
+    char *end;
+    long v = strtol(p, &end, 10);
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
+    if (*end != '\0' || v < 1 || v > 1440) return false;
+    minutes = (int)v;
+  }
+  if ((from.flags & 0x01) == 0) {
+    MESH_DEBUG_PRINTLN("gps trigger ignored (not favourite) from=%s text=%s", from.name, text);
+    return true;
+  }
+  uint8_t prefix[7]; memcpy(prefix, from.id.pub_key, 7);
+  if (isOff) {
+    for (int i = 0; i < MAX_GPS_LEASES; i++) if (gpsLeases[i].used && memcmp(gpsLeases[i].prefix, prefix, 7)==0) {
+      gpsLeases[i].used = false;
+      MESH_DEBUG_PRINTLN("gps off for %s", from.name);
+    }
+    reconcileGpsFromLeases();
+    return true;
+  } else {
+    // !gps on arms a poll-renewed lease (expires 5 min after the last LOC
+    // telemetry poll from this requester); !gps N keeps its fixed window.
+    // Slot 0 is the LOCAL lease (the watch's own polls) — remote triggers
+    // never take or evict it.
+    bool renewable = isOn;
+    uint32_t windowMs = renewable ? GPS_POLL_RENEW_MS : (uint32_t)minutes * 60000UL;
+    uint32_t endsAt = millis() + windowMs;
+    int slot = -1;
+    for (int i = 0; i < MAX_GPS_LEASES; i++) if (gpsLeases[i].used && memcmp(gpsLeases[i].prefix, prefix, 7)==0) { slot = i; break; }
+    if (slot == -1) for (int i = LOCAL_GPS_LEASE_SLOT + 1; i < MAX_GPS_LEASES; i++) if (!gpsLeases[i].used) { slot = i; break; }
+    if (slot == -1) slot = LOCAL_GPS_LEASE_SLOT + 1;
+    memcpy(gpsLeases[slot].prefix, prefix, 7);
+    gpsLeases[slot].endsAt = endsAt;
+    gpsLeases[slot].renewable = renewable;
+    gpsLeases[slot].used = true;
+    strncpy(gpsLeases[slot].name, from.name, sizeof(gpsLeases[slot].name)-1);
+    sensors.setSettingValue("gps", "1");
+    // Cadence is owned by the friend's watch: a remote !gps N must not
+    // overwrite whatever the friend's setCustomVar("gps_interval", ...)
+    // already established. The lease + gps:1 are the only side effects.
+    if (renewable) { MESH_DEBUG_PRINTLN("gps on (poll-renewed) for %s", from.name); }
+    else { MESH_DEBUG_PRINTLN("gps on for %s %d min", from.name, minutes); }
+    return true;
+  }
+}
+
+void MyMesh::reconcileGpsFromLeases() {
+  bool any = false; for (int i=0;i<MAX_GPS_LEASES;i++) if (gpsLeases[i].used) { any = true; break; }
+  if (!any) { sensors.setSettingValue("gps", "0"); MESH_DEBUG_PRINTLN("gps off (no leases)"); }
+}
+
+void MyMesh::updateGpsLeases() {
+  bool expired = false; uint32_t now = millis();
+  for (int i=0;i<MAX_GPS_LEASES;i++) if (gpsLeases[i].used && (int32_t)(now - gpsLeases[i].endsAt) >= 0) {
+    MESH_DEBUG_PRINTLN("gps lease expired for %s", gpsLeases[i].name);
+    gpsLeases[i].used = false; expired = true;
+  }
+  if (expired) reconcileGpsFromLeases();
+}
+
+// The watch's own self-telemetry polls renew the LOCAL lease (slot 0) the
+// same way a remote LOC poll renews a remote lease: GPS stays warm while the
+// watch keeps asking and sleeps GPS_POLL_RENEW_MS after the last poll, instead
+// of the watch cutting power with an immediate gps:0. Arms the lease on first
+// use so no explicit opt-in is needed over BLE.
+void MyMesh::renewLocalGpsLease() {
+  GpsLease &slot = gpsLeases[LOCAL_GPS_LEASE_SLOT];
+  if (!slot.used) {
+    memcpy(slot.prefix, self_id.pub_key, 7);
+    slot.renewable = true;
+    slot.used = true;
+    strncpy(slot.name, "local", sizeof(slot.name)-1);
+    sensors.setSettingValue("gps", "1");
+    MESH_DEBUG_PRINTLN("gps local lease armed");
+  }
+  slot.endsAt = millis() + GPS_POLL_RENEW_MS;
+}
+
 
 void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt, uint32_t timestamp,
                                   const char *text) {
@@ -650,6 +745,45 @@ uint8_t MyMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_tim
 
     uint8_t perm_mask = ~(data[1]);    // NEW: first reserved byte (of 4), is now inverse mask to apply to permissions
     permissions &= perm_mask;
+
+    // Favourited (starred) contacts always get GPS — must survive the request's inverse mask
+    if (contact.flags & 0x01) {
+      permissions |= (TELEM_PERM_BASE | TELEM_PERM_LOCATION);
+    }
+
+    // Poll-renewed GPS lease: a renewable lease (!gps on, or auto-armed
+    // below) is refreshed by every LOC telemetry poll from that requester,
+    // so the friend's GPS stays on while the finder's watch keeps polling
+    // and sleeps 5 min after the last poll. Fixed !gps N leases keep their
+    // explicit window.
+    if (permissions & TELEM_PERM_LOCATION) {
+      uint8_t rprefix[7]; memcpy(rprefix, contact.id.pub_key, 7);
+      int slot = -1;
+      for (int i = LOCAL_GPS_LEASE_SLOT + 1; i < MAX_GPS_LEASES; i++) {
+        if (gpsLeases[i].used && memcmp(gpsLeases[i].prefix, rprefix, 7)==0) { slot = i; break; }
+      }
+      if (slot != -1 && gpsLeases[slot].renewable) {
+        gpsLeases[slot].endsAt = millis() + GPS_POLL_RENEW_MS;
+      } else if (slot == -1) {
+        // No lease: a permissioned LOC poll is an explicit request for live
+        // position, so arm a renewable lease rather than answering from a
+        // sleeping GPS. Same window as !gps on; !gps off still clears it
+        // (the next poll re-arms, which is the requester's stated intent).
+        // Slot 0 is the LOCAL lease (the watch's own polls) — never take or
+        // evict it for a remote requester.
+        int free = -1;
+        for (int i = LOCAL_GPS_LEASE_SLOT + 1; i < MAX_GPS_LEASES; i++) if (!gpsLeases[i].used) { free = i; break; }
+        if (free == -1) free = LOCAL_GPS_LEASE_SLOT + 1;
+        memcpy(gpsLeases[free].prefix, rprefix, 7);
+        gpsLeases[free].endsAt = millis() + GPS_POLL_RENEW_MS;
+        gpsLeases[free].renewable = true;
+        gpsLeases[free].used = true;
+        strncpy(gpsLeases[free].name, contact.name, sizeof(gpsLeases[free].name)-1);
+        sensors.setSettingValue("gps", "1");
+        MESH_DEBUG_PRINTLN("gps auto-armed (poll) for %s", contact.name);
+      }
+      // Fixed-window (!gps N) leases are left alone: their explicit window wins.
+    }
 
     if (permissions & TELEM_PERM_BASE) { // only respond if base permission bit is set
       telemetry.reset();
@@ -1649,6 +1783,9 @@ void MyMesh::handleCmdFrame(size_t len) {
       writeErrFrame(ERR_CODE_NOT_FOUND); // contact not found
     }
   } else if (cmd_frame[0] == CMD_SEND_TELEMETRY_REQ && len == 4) {  // 'self' telemetry request
+    // The watch asking for its own position renews the LOCAL lease, so GPS
+    // lingers warm between sessions instead of cutting off on gps:0.
+    renewLocalGpsLease();
     telemetry.reset();
     telemetry.addVoltage(TELEM_CHANNEL_SELF, (float)board.getBattMilliVolts() / 1000.0f);
     float temperature = board.getMCUTemperature();
@@ -1665,6 +1802,7 @@ void MyMesh::handleCmdFrame(size_t len) {
     memcpy(&out_frame[i], self_id.pub_key, 6);
     i += 6; // pub_key_prefix
     uint8_t tlen = telemetry.getSize();
+    if (i + tlen > MAX_FRAME_SIZE) tlen = MAX_FRAME_SIZE - i;
     memcpy(&out_frame[i], telemetry.getBuffer(), tlen);
     i += tlen;
     _serial->writeFrame(out_frame, i);
@@ -1824,17 +1962,23 @@ void MyMesh::handleCmdFrame(size_t len) {
       bool success = sensors.setSettingValue(sp, np);
       if (success) {
         #if ENV_INCLUDE_GPS == 1
-        // Update node preferences for GPS settings
         if (strcmp(sp, "gps") == 0) {
-          _prefs.gps_enabled = (np[0] == '1') ? 1 : 0;
-          savePrefs();
+          if (np[0] == '0') {
+            bool leasesActive = false; for (int i=0;i<MAX_GPS_LEASES;i++) if (gpsLeases[i].used) { leasesActive=true; break; }
+            if (leasesActive) {
+              MESH_DEBUG_PRINTLN("gps:0 from watch ignored (leases active)");
+              writeOKFrame();
+            } else { _prefs.gps_enabled = 0; savePrefs(); writeOKFrame(); }
+          } else { _prefs.gps_enabled = 1; savePrefs(); writeOKFrame(); }
         } else if (strcmp(sp, "gps_interval") == 0) {
           uint32_t interval_seconds = atoi(np);
           _prefs.gps_interval = constrain(interval_seconds, 0, 86400);
           savePrefs();
-        }
-        #endif
+          writeOKFrame();
+        } else { writeOKFrame(); }
+        #else
         writeOKFrame();
+        #endif
       } else {
         writeErrFrame(ERR_CODE_ILLEGAL_ARG);
       }
@@ -2228,6 +2372,8 @@ void MyMesh::checkSerialInterface() {
 
 void MyMesh::loop() {
   BaseChatMesh::loop();
+
+  updateGpsLeases();
 
   if (_cli_rescue) {
     checkCLIRescueCmd();
