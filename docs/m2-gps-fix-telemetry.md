@@ -118,14 +118,26 @@ consumer, not here.
 
 ## GPS leases (remote power control)
 
-Unchanged by the above, recorded here because it governs when the entries
-flow. `MyMesh.cpp` holds up to 4 per-prefix leases (`gpsLeases`):
+`MyMesh.cpp` holds up to 4 per-prefix leases (`gpsLeases`):
 `!gps on` (favourite-only DM) arms a poll-renewed lease — refreshed by every
 LOC telemetry poll from that requester, expires 5 min after the last poll;
 `!gps N` keeps a fixed N-minute window; `!gps off` clears. A permissioned
 LOC telemetry request with **no** existing lease now auto-arms a renewable
 one (same 5-min window) instead of answering from a sleeping GPS — one-shot
 polls from apps just work, no `!gps` DM needed first. Fixed-window leases
-are never overwritten by polls. The watch's `gps:0` (`setCustomVar`) is
-ignored while any lease is active. Expiry is swept in `updateGpsLeases()`;
+are never overwritten by polls. Expiry is swept in `updateGpsLeases()`;
 with no leases left, `reconcileGpsFromLeases` sleeps the hardware.
+
+Slot 0 (`LOCAL_GPS_LEASE_SLOT`) is reserved for the LOCAL lease: the watch's
+own self-telemetry polls (`CMD_SEND_TELEMETRY_REQ`, len 4) renew it via
+`renewLocalGpsLease()`, so local GPS lingers warm for 5 min after the last
+poll instead of cutting off on an immediate `gps:0`. Remote triggers and the
+auto-arm path never take or evict slot 0 (they scan from slot 1 and evict
+slot 1 when full). The watch no longer sends `gps:0` at all — no backwards
+compatibility is kept, pre-lease firmware is out of scope.
+
+Why this exists: the receiver cold-starts on every session when the watch
+cuts power immediately, so reacquire takes longest exactly when the wearer
+just asked for position. A lingering lease keeps the almanac warm across
+closely-spaced sessions at the cost of up to 5 min of extra GPS power after
+each use.

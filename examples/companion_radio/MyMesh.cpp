@@ -580,13 +580,15 @@ bool MyMesh::handleGpsTrigger(const ContactInfo &from, const char *text) {
   } else {
     // !gps on arms a poll-renewed lease (expires 5 min after the last LOC
     // telemetry poll from this requester); !gps N keeps its fixed window.
+    // Slot 0 is the LOCAL lease (the watch's own polls) — remote triggers
+    // never take or evict it.
     bool renewable = isOn;
     uint32_t windowMs = renewable ? GPS_POLL_RENEW_MS : (uint32_t)minutes * 60000UL;
     uint32_t endsAt = millis() + windowMs;
     int slot = -1;
     for (int i = 0; i < MAX_GPS_LEASES; i++) if (gpsLeases[i].used && memcmp(gpsLeases[i].prefix, prefix, 7)==0) { slot = i; break; }
-    if (slot == -1) for (int i = 0; i < MAX_GPS_LEASES; i++) if (!gpsLeases[i].used) { slot = i; break; }
-    if (slot == -1) slot = 0;
+    if (slot == -1) for (int i = LOCAL_GPS_LEASE_SLOT + 1; i < MAX_GPS_LEASES; i++) if (!gpsLeases[i].used) { slot = i; break; }
+    if (slot == -1) slot = LOCAL_GPS_LEASE_SLOT + 1;
     memcpy(gpsLeases[slot].prefix, prefix, 7);
     gpsLeases[slot].endsAt = endsAt;
     gpsLeases[slot].renewable = renewable;
@@ -614,6 +616,24 @@ void MyMesh::updateGpsLeases() {
     gpsLeases[i].used = false; expired = true;
   }
   if (expired) reconcileGpsFromLeases();
+}
+
+// The watch's own self-telemetry polls renew the LOCAL lease (slot 0) the
+// same way a remote LOC poll renews a remote lease: GPS stays warm while the
+// watch keeps asking and sleeps GPS_POLL_RENEW_MS after the last poll, instead
+// of the watch cutting power with an immediate gps:0. Arms the lease on first
+// use so no explicit opt-in is needed over BLE.
+void MyMesh::renewLocalGpsLease() {
+  GpsLease &slot = gpsLeases[LOCAL_GPS_LEASE_SLOT];
+  if (!slot.used) {
+    memcpy(slot.prefix, self_id.pub_key, 7);
+    slot.renewable = true;
+    slot.used = true;
+    strncpy(slot.name, "local", sizeof(slot.name)-1);
+    sensors.setSettingValue("gps", "1");
+    MESH_DEBUG_PRINTLN("gps local lease armed");
+  }
+  slot.endsAt = millis() + GPS_POLL_RENEW_MS;
 }
 
 
@@ -739,7 +759,7 @@ uint8_t MyMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_tim
     if (permissions & TELEM_PERM_LOCATION) {
       uint8_t rprefix[7]; memcpy(rprefix, contact.id.pub_key, 7);
       int slot = -1;
-      for (int i = 0; i < MAX_GPS_LEASES; i++) {
+      for (int i = LOCAL_GPS_LEASE_SLOT + 1; i < MAX_GPS_LEASES; i++) {
         if (gpsLeases[i].used && memcmp(gpsLeases[i].prefix, rprefix, 7)==0) { slot = i; break; }
       }
       if (slot != -1 && gpsLeases[slot].renewable) {
@@ -749,9 +769,11 @@ uint8_t MyMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_tim
         // position, so arm a renewable lease rather than answering from a
         // sleeping GPS. Same window as !gps on; !gps off still clears it
         // (the next poll re-arms, which is the requester's stated intent).
+        // Slot 0 is the LOCAL lease (the watch's own polls) — never take or
+        // evict it for a remote requester.
         int free = -1;
-        for (int i = 0; i < MAX_GPS_LEASES; i++) if (!gpsLeases[i].used) { free = i; break; }
-        if (free == -1) free = 0;
+        for (int i = LOCAL_GPS_LEASE_SLOT + 1; i < MAX_GPS_LEASES; i++) if (!gpsLeases[i].used) { free = i; break; }
+        if (free == -1) free = LOCAL_GPS_LEASE_SLOT + 1;
         memcpy(gpsLeases[free].prefix, rprefix, 7);
         gpsLeases[free].endsAt = millis() + GPS_POLL_RENEW_MS;
         gpsLeases[free].renewable = true;
@@ -1761,6 +1783,9 @@ void MyMesh::handleCmdFrame(size_t len) {
       writeErrFrame(ERR_CODE_NOT_FOUND); // contact not found
     }
   } else if (cmd_frame[0] == CMD_SEND_TELEMETRY_REQ && len == 4) {  // 'self' telemetry request
+    // The watch asking for its own position renews the LOCAL lease, so GPS
+    // lingers warm between sessions instead of cutting off on gps:0.
+    renewLocalGpsLease();
     telemetry.reset();
     telemetry.addVoltage(TELEM_CHANNEL_SELF, (float)board.getBattMilliVolts() / 1000.0f);
     float temperature = board.getMCUTemperature();
