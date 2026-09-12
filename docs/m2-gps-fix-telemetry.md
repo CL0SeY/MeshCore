@@ -1,11 +1,12 @@
 # M2 GPS fix telemetry — firmware interface
 
-M2 (`aae9f5f3`) adds two CayenneLPP entries to the telemetry reply on channel 1
-(`TELEM_CHANNEL_SELF`), reporting the node's own GPS-fix health. This doc is the
-interface contract for decoder authors (watch app, stock app, anything parsing
-`PACKET_TELEMETRY_RESPONSE`). The normative protocol description lives in
-`docs/companion_protocol.md` ("Telemetry Payload"); this file records the
-encoding details and per-board differences that the protocol doc does not.
+M2 (`aae9f5f3`, extended by `461ee7cf`) adds two CayenneLPP entries to the
+telemetry reply on channel 1 (`TELEM_CHANNEL_SELF`), reporting the node's own
+GPS-fix health. This doc is the interface contract for decoder authors (watch
+app, stock app, anything parsing `PACKET_TELEMETRY_RESPONSE`). The normative
+protocol description lives in `docs/companion_protocol.md` ("Telemetry
+Payload"); this file records the encoding details and per-board differences
+that the protocol doc does not.
 
 ## Interface
 
@@ -15,52 +16,61 @@ Single shared emitter, `src/helpers/sensors/GpsTelemetry.h`
 | Entry | Type | Payload on the wire | Emit condition |
 |---|---|---|---|
 | Fix time | UnixTime `0x85` | 4 B big-endian **uint32** seconds since epoch | `location->isValid()` **and** timestamp ≥ 2020-01-01 — **even when GPS is asleep**, so a cached position carries its age |
-| Sats in use | GenericSensor `0x64` (first) | 4 B big-endian **uint32** count | GPS active (`gps_active`, provider non-null) |
-| Fix clock | GenericSensor `0x64` (second) | 4 B big-endian **uint32** HHMMSS, UTC, e.g. 170330 | Same gate as the stamp (valid fix + plausible clock) |
+| Sats + clock | GenericSensor `0x64` | 4 B big-endian **uint32**, `sats × 10⁶ + HHMMSS` — e.g. `12170330` = 12 sats at 17:03:30 UTC | GPS active, **or** a cached fix exists while asleep (count reads 0 then) |
 
-Wire order on channel 1 is always `0x85`, `0x64` (sats), `0x64` (HHMMSS).
-When GPS is asleep with a cached fix, the layout is `0x85`, `0x64` (**0**
-placeholder), `0x64` (HHMMSS) — the zero holds the first-`0x64` slot so
-decoders that take the first `0x64` as sats keep reading correctly. When
-GPS is asleep with no fix ever, nothing is emitted.
+Exactly one `0x64` entry, never two. Wire order on channel 1 is `0x85` then
+`0x64`. Nothing is emitted when the provider is null or GPS is asleep with no
+fix ever.
 
-Both-absent still means: provider null, GPS off with no cached fix, or
-pre-M2 firmware. "Count present, stamp absent" (GPS on, searching) is
-unchanged. New state: "stamp present, count zero" means the position is
-cached — judge its age from the stamp.
+"Stamp absent" means no plausible fix at emit (searching, or never fixed);
+"count reads 0" with a stamp present means the position is cached — judge its
+age from the stamp. Both-absent means provider null, GPS off with no cached
+fix, or pre-M2 firmware.
 
 Order on channel 1 is voltage (`0x74`), GPS (`0x88`), then `0x85`, `0x64`
 (the diagnostics ride the same `querySensors` call, right after `addGPS`).
 Environment sensors start at channel 2, so channel-1 `0x64` is unambiguous —
-but note `0x64` on channels ≥ 2 is gas resistance / IAQ, never a sat count.
+but note `0x64` on channels ≥ 2 is gas resistance / IAQ, never this value.
+
+## Why one packed entry, not two
+
+The satellite count and the clock were originally two separate `0x64` entries.
+Companion UIs that key LPP entries by `(channel, type)` **collapse duplicate
+types**, so the second entry never rendered — the app showed one "Generic
+Sensor" row and the clock was invisible on the wire. Packing both facts into a
+single value keeps one entry per type, which every consumer renders.
+
+Decode: `sats = value / GPS_TELEM_CLOCK_MODULUS`, `clock = value % modulus`
+(`GPS_TELEM_CLOCK_MODULUS` = `1000000`). The clock is always `0..235959`, so it
+can never carry into the satellite field. A clock of `0` means either 00:00:00
+UTC or no plausible fix — those are indistinguishable, which is deliberate:
+`0x85` carries the machine-readable truth and this entry is for at-a-glance
+field reading.
 
 ## The `0x64` encoding trap (decoder authors read this)
-The call site reads `addGenericSensor(channel, (float) count)`, which looks
+
+The call site reads `addGenericSensor(channel, (float) value)`, which looks
 like a float payload. It is not. The CayenneLPP library's templated `addField`
 (`CayenneLPP.cpp`, `LPP_GENERIC_SENSOR_MULT 1`) multiplies the value by 1 and
 writes the **raw uint32 bytes** — the `float` parameter never becomes IEEE-754
-bits on the wire. Decoders **must** read `0x64` as big-endian uint32.
+bits on the wire. Decoders **must** read `0x64` as big-endian uint32, then
+split off the packed fields.
 
-Concretely: 25 sats hits the wire as `00 00 00 19`. A decoder reading float
-bits sees ~3.5e-44 and truncates to 0 — every real count decodes as 0. This
-actually happened (watch app, 2026-09-12): the "LR1110 always reports 0" story
-was a decoder bug, and the stock app (uint32 decode) showed the live 25 all
-along. Any new decoder should regression-test with raw `00 00 00 19` ⇒ 25.
+The historical trap: while `0x64` carried a bare count, 25 sats hit the wire as
+`00 00 00 19`. A decoder reading float bits sees ~3.5e-44 and truncates to 0 —
+every real count decoded as 0. This actually happened (watch app, 2026-09-12):
+the "LR1110 always reports 0" story was a decoder bug, and the stock app
+(uint32 decode) showed the live 25 all along. Any new decoder should
+regression-test with a raw uint32 payload it reads correctly.
 
-## The HHMMSS clock (decoder authors read this)
+## The packed clock (decoder authors read this)
 
-The second channel-1 `0x64` is the fix wall clock as `HH*10000 + MM*100 + SS`
+The low six digits of `0x64` are the fix wall clock as `HH*10000 + MM*100 + SS`
 (`gpsFixTimeHhmmss`), e.g. 170330 for 17:03:30 — for field diagnosis in apps
 that render LPP numerics raw, where a unix stamp costs mental arithmetic.
 Derived from the same unix timestamp as `0x85` (no extra provider interface),
-emitted under the same gate. **UTC always** — the node has no timezone, so
+present under the same gate. **UTC always** — the node has no timezone, so
 don't read local time into it. Range 0..235959; midnight is 0.
-
-Two `0x64` entries share channel 1, distinguished by **order**: sats first,
-clock second. Decoders take the first as sats and ignore (or display) the
-second. The watch decoder's `satelliteCount == null` guard does exactly this
-and needs no change. Stock apps show two "Generic Sensor" rows: count, then
-clock.
 
 ## The `0x85` clock (decoder authors read this)
 
@@ -96,14 +106,15 @@ Two consequences for decoders:
 
 ## Tests
 
-`test/test_gps_telemetry/` (11 host-side cases against a recording
-`CayenneLPP` mock in `test/mocks/CayenneLPP.h`) covers the emit conditions:
-`0x85` on valid fix + plausible clock **even with GPS asleep**, `0x64` sats
-whenever active, zero-placeholder + HHMMSS while asleep with a cached fix,
-nothing when asleep with no fix, the HHMMSS known vector (17:03:30 UTC ⇒
-170330), and the sats-before-HHMMSS wire order in both layouts. Note the mock
-records calls, not bytes — a decoder-side regression test with raw wire bytes
-(e.g. `00 00 00 19` ⇒ 25) lives with each consumer, not here.
+`test/test_gps_telemetry/` (9 host-side cases against a recording `CayenneLPP`
+mock in `test/mocks/CayenneLPP.h`) covers the emit conditions and the packing:
+the HHMMSS known vector (17:03:30 UTC ⇒ 170330) and that the clock never
+reaches the modulus, awake-with-fix ⇒ `0x85` + packed `(12, 170330)`,
+awake-without-fix ⇒ packed `(7, 0)`, implausible clock ⇒ `(3, 0)` not garbage,
+asleep-with-cached-fix ⇒ `0x85` + packed `(0, 170330)`, asleep-without-fix and
+null provider ⇒ nothing, and channel-1-only. Note the mock records calls, not
+bytes — a decoder-side regression test with raw wire bytes lives with each
+consumer, not here.
 
 ## GPS leases (remote power control)
 

@@ -1,8 +1,9 @@
 // Host-side tests for addGpsFixTelemetry (GpsTelemetry.h).
 //
-// Verifies the gating logic (isValid, gps_active, plausibility) against the
-// recording CayenneLPP mock. Does NOT prove the real wire bytes — that is
-// verified empirically against the ElectronicCats library (see plan §wire-layout).
+// Verifies the gating logic (isValid, gps_active, plausibility) and the packed
+// sats+clock encoding against the recording CayenneLPP mock. Does NOT prove the
+// real wire bytes — that is verified empirically against the ElectronicCats
+// library (see plan §wire-layout).
 //
 // NOTE: env:native resolves <helpers/SensorManager.h> against real src/Mesh.h
 // (the -I src order precedes -I test/mocks). The sibling env:native_kiss_modem
@@ -45,7 +46,10 @@ public:
   bool isEnabled()    override { return true; }
 };
 
-// Expect exactly one unix-time call with the given timestamp.
+// 2026-01-01 17:03:30 UTC — a timestamp with a known wall clock, so the
+// arithmetic is guarded against a known vector rather than only against itself.
+static const long TS_170330 = 1767287010L;
+
 static void expectUnixTime(const CayenneLPP& lpp, uint32_t expected_ts) {
   bool found = false;
   for (const auto& c : lpp.calls) {
@@ -64,89 +68,61 @@ static void expectNoUnixTime(const CayenneLPP& lpp) {
   }
 }
 
-static void expectSats(const CayenneLPP& lpp, uint32_t expected) {
-  bool found = false;
-  for (const auto& c : lpp.calls) {
-    if (c.type == 0x64) {
-      ASSERT_EQ(c.channel, 1u);
-      ASSERT_EQ(c.value, expected);
-      found = true;
-      break;   // FIRST 0x64 is the sat count; a second 0x64 is the HHMMSS clock
-    }
-  }
-  ASSERT_TRUE(found) << "expected sats entry with value " << expected;
-}
-
-// Expect the HHMMSS clock as the SECOND 0x64 entry with the given value.
-static void expectHhmmss(const CayenneLPP& lpp, uint32_t expected) {
+// The single channel-1 0x64 entry packs sats in the high digits and the UTC
+// wall clock in the low six. Exactly one such entry is expected: a second
+// would be collapsed by companion UIs that key LPP by (channel, type).
+static void expectPacked(const CayenneLPP& lpp, uint32_t sats, uint32_t hhmmss) {
   int seen = 0;
   for (const auto& c : lpp.calls) {
-    if (c.type == 0x64) {
-      seen++;
-      if (seen == 2) {
-        EXPECT_EQ(c.channel, 1u);
-        EXPECT_EQ(c.value, expected);
-        return;
-      }
-    }
+    if (c.type != 0x64) continue;
+    seen++;
+    EXPECT_EQ(c.channel, 1u);
+    EXPECT_EQ(c.value, sats * GPS_TELEM_CLOCK_MODULUS + hhmmss)
+        << "packed value should be sats*1e6 + HHMMSS";
   }
-  FAIL() << "expected second 0x64 (HHMMSS) entry with value " << expected << " (saw " << seen << " 0x64 entries)";
-}
-
-static void expectNoHhmmss(const CayenneLPP& lpp) {
-  int seen = 0;
-  for (const auto& c : lpp.calls) {
-    if (c.type == 0x64) seen++;
-  }
-  ASSERT_LE(seen, 1) << "unexpected HHMMSS (second 0x64) entry";
-}
-
-static void expectNoSats(const CayenneLPP& lpp) {
-  for (const auto& c : lpp.calls) {
-    ASSERT_NE(c.type, 0x64) << "unexpected sats entry";
-  }
-}
-
-TEST(GpsTelemetry, ValidFixPlausibleTime) {
-  CayenneLPP lpp(64);
-  FakeLocationProvider p;
-  p.fix = true;
-  p.ts  = 1757500000L;
-  p.sats = 9;
-
-  addGpsFixTelemetry(lpp, &p, true);
-
-  EXPECT_EQ(lpp.calls.size(), 3u);   // 0x85 + 0x64 (sats) + 0x64 (HHMMSS)
-  expectUnixTime(lpp, 1757500000u);
-  expectSats(lpp, 9u);
-  expectHhmmss(lpp, gpsFixTimeHhmmss(1757500000L));
+  EXPECT_EQ(seen, 1) << "expected exactly one packed 0x64 entry, saw " << seen;
 }
 
 TEST(GpsTelemetry, HhmmssKnownVector) {
-  // 2026-01-01 17:03:30 UTC -> 170330. Guards the /% arithmetic, not just
-  // self-consistency with the helper.
-  EXPECT_EQ(gpsFixTimeHhmmss(1767287010L), 170330u);
+  EXPECT_EQ(gpsFixTimeHhmmss(TS_170330), 170330u);
   EXPECT_EQ(gpsFixTimeHhmmss(1767225600L), 0u);        // midnight -> 0
   EXPECT_EQ(gpsFixTimeHhmmss(1767311999L), 235959u);   // 23:59:59 -> 235959
 }
 
-TEST(GpsTelemetry, ValidFixImplausibleTimeZero) {
+TEST(GpsTelemetry, ClockStaysBelowModulus) {
+  // The clock must never carry into the satellite field.
+  EXPECT_LT(gpsFixTimeHhmmss(1767311999L), GPS_TELEM_CLOCK_MODULUS);
+}
+
+TEST(GpsTelemetry, AwakeWithFixPacksSatsAndClock) {
   CayenneLPP lpp(64);
   FakeLocationProvider p;
   p.fix = true;
-  p.ts  = 0;
+  p.ts  = TS_170330;
+  p.sats = 12;
+
+  addGpsFixTelemetry(lpp, &p, true);
+
+  EXPECT_EQ(lpp.calls.size(), 2u);   // 0x85 + packed 0x64
+  expectUnixTime(lpp, 1767287010u);
+  expectPacked(lpp, 12u, 170330u);   // 12170330
+}
+
+TEST(GpsTelemetry, AwakeWithoutFixPacksSatsWithZeroClock) {
+  CayenneLPP lpp(64);
+  FakeLocationProvider p;
+  p.fix = false;
+  p.ts  = TS_170330;
   p.sats = 7;
 
   addGpsFixTelemetry(lpp, &p, true);
 
-  // implausible → no unix-time and no HHMMSS, sats still emitted
-  EXPECT_EQ(lpp.calls.size(), 1u);
+  EXPECT_EQ(lpp.calls.size(), 1u);   // no stamp, packed entry only
   expectNoUnixTime(lpp);
-  expectSats(lpp, 7u);
-  expectNoHhmmss(lpp);
+  expectPacked(lpp, 7u, 0u);
 }
 
-TEST(GpsTelemetry, ValidFixImplausibleTimeBeforeThreshold) {
+TEST(GpsTelemetry, ImplausibleClockReadsZeroNotGarbage) {
   CayenneLPP lpp(64);
   FakeLocationProvider p;
   p.fix = true;
@@ -157,44 +133,26 @@ TEST(GpsTelemetry, ValidFixImplausibleTimeBeforeThreshold) {
 
   EXPECT_EQ(lpp.calls.size(), 1u);
   expectNoUnixTime(lpp);
-  expectSats(lpp, 3u);
-  expectNoHhmmss(lpp);
+  expectPacked(lpp, 3u, 0u);
 }
 
-TEST(GpsTelemetry, NoFix) {
-  CayenneLPP lpp(64);
-  FakeLocationProvider p;
-  p.fix = false;
-  p.ts  = 1757500000L;
-  p.sats = 5;
-
-  addGpsFixTelemetry(lpp, &p, true);
-
-  // no fix → no unix-time and no HHMMSS, sats still emitted
-  EXPECT_EQ(lpp.calls.size(), 1u);
-  expectNoUnixTime(lpp);
-  expectSats(lpp, 5u);
-  expectNoHhmmss(lpp);
-}
-
-TEST(GpsTelemetry, GpsInactiveCachedFix) {
+TEST(GpsTelemetry, AsleepWithCachedFixKeepsStampAndClock) {
   CayenneLPP lpp(64);
   FakeLocationProvider p;
   p.fix = true;            // latched valid fix...
-  p.ts  = 1757500000L;
+  p.ts  = TS_170330;
   p.sats = 9;
 
   addGpsFixTelemetry(lpp, &p, false);  // ...but GPS asleep
 
-  // Cached position carries its stamp + HHMMSS clock; the zero placeholder
-  // holds the first-0x64 slot so decoders read sats=0, clock second.
-  EXPECT_EQ(lpp.calls.size(), 3u);
-  expectUnixTime(lpp, 1757500000u);
-  expectSats(lpp, 0u);
-  expectHhmmss(lpp, gpsFixTimeHhmmss(1757500000L));
+  // Cached position carries its stamp and clock; the count reads 0 because
+  // sats-in-use is meaningless with the receiver off.
+  EXPECT_EQ(lpp.calls.size(), 2u);
+  expectUnixTime(lpp, 1767287010u);
+  expectPacked(lpp, 0u, 170330u);
 }
 
-TEST(GpsTelemetry, GpsInactiveNoFix) {
+TEST(GpsTelemetry, AsleepWithoutFixEmitsNothing) {
   CayenneLPP lpp(64);
   FakeLocationProvider p;
   p.fix = false;
@@ -203,7 +161,6 @@ TEST(GpsTelemetry, GpsInactiveNoFix) {
 
   addGpsFixTelemetry(lpp, &p, false);
 
-  // asleep and never fixed → nothing emitted
   EXPECT_EQ(lpp.calls.size(), 0u);
 }
 
@@ -219,45 +176,12 @@ TEST(GpsTelemetry, ChannelOne) {
   CayenneLPP lpp(64);
   FakeLocationProvider p;
   p.fix = true;
-  p.ts  = 1757500000L;
+  p.ts  = TS_170330;
   p.sats = 12;
 
   addGpsFixTelemetry(lpp, &p, true);
 
   for (const auto& c : lpp.calls) {
     EXPECT_EQ(c.channel, 1u) << "all entries must be on channel 1 (TELEM_CHANNEL_SELF)";
-  }
-}
-
-TEST(GpsTelemetry, WireOrderSatsBeforeHhmmss) {
-  // Decoders take the FIRST 0x64 as sats: sats must precede HHMMSS on the
-  // wire in every layout, awake or asleep.
-  {
-    CayenneLPP lpp(64);
-    FakeLocationProvider p;
-    p.fix = true;
-    p.ts  = 1767287010L;   // 17:03:30 UTC
-    p.sats = 12;
-    addGpsFixTelemetry(lpp, &p, true);
-    ASSERT_EQ(lpp.calls.size(), 3u);
-    EXPECT_EQ(lpp.calls[0].type, 0x85);
-    EXPECT_EQ(lpp.calls[1].type, 0x64);
-    EXPECT_EQ(lpp.calls[1].value, 12u);
-    EXPECT_EQ(lpp.calls[2].type, 0x64);
-    EXPECT_EQ(lpp.calls[2].value, 170330u);
-  }
-  {
-    CayenneLPP lpp(64);
-    FakeLocationProvider p;
-    p.fix = true;
-    p.ts  = 1767287010L;
-    p.sats = 12;
-    addGpsFixTelemetry(lpp, &p, false);
-    ASSERT_EQ(lpp.calls.size(), 3u);
-    EXPECT_EQ(lpp.calls[0].type, 0x85);
-    EXPECT_EQ(lpp.calls[1].type, 0x64);
-    EXPECT_EQ(lpp.calls[1].value, 0u);
-    EXPECT_EQ(lpp.calls[2].type, 0x64);
-    EXPECT_EQ(lpp.calls[2].value, 170330u);
   }
 }
