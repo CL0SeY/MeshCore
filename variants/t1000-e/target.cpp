@@ -82,17 +82,6 @@ mesh::LocalIdentity radio_new_identity() {
 
 void T1000SensorManager::start_gps() {
   gps_active = true;
-#ifdef PIN_STATUS_LED
-  // Two green flashes: GPS just powered on. Transient — the ui-orig heartbeat
-  // owns the LED the rest of the time, so this never fights it for long.
-  digitalWrite(PIN_STATUS_LED, LED_STATE_ON);
-  delay(120);
-  digitalWrite(PIN_STATUS_LED, !LED_STATE_ON);
-  delay(120);
-  digitalWrite(PIN_STATUS_LED, LED_STATE_ON);
-  delay(120);
-  digitalWrite(PIN_STATUS_LED, !LED_STATE_ON);
-#endif
   //_nmea->begin();
   // this init sequence should be better 
   // comes from seeed examples and deals with all gps pins

@@ -10,6 +10,7 @@
 #define LED_ON_MILLIS     20
 #define LED_ON_MSG_MILLIS 200
 #define LED_CYCLE_MILLIS  4000
+#define LED_GAP_MILLIS    160   // dark gap between the two pulses of the GPS beat
 #endif
 
 #if defined(PIN_STATUS_LED_R) && defined(PIN_STATUS_LED_G) && defined(PIN_STATUS_LED_B)
@@ -384,25 +385,53 @@ void UITask::userLedHandler() {
     }
   }
 #elif defined(PIN_STATUS_LED)
-  static int state = 0;
+  static int state = 0;          // 0 dark, 1 first pulse, 2 gap, 3 second pulse
   static int next_change = 0;
   static int last_increment = 0;
 
+  // While the GPS is powered the heartbeat double-pulses, so "is GPS on right
+  // now" is answerable on any cycle rather than only in the moment it is
+  // switched on. Unread messages keep their long single flash and win.
+  bool gps_beat = false;
+  if (_sensors != NULL && _msgcount == 0) {
+    const char* gps = _sensors->getSettingByKey("gps");
+    gps_beat = gps != NULL && gps[0] == '1';
+  }
+
   int cur_time = millis();
   if (cur_time > next_change) {
-    if (state == 0) {
-      state = 1;
-      if (_msgcount > 0) {
-        last_increment = LED_ON_MSG_MILLIS;
-      } else {
-        last_increment = LED_ON_MILLIS;
-      }
-      next_change = cur_time + last_increment;
-    } else {
-      state = 0;
-      next_change = cur_time + LED_CYCLE_MILLIS - last_increment;
+    switch (state) {
+      case 0:   // dark between beats -> light the first pulse
+        state = 1;
+        last_increment = (_msgcount > 0) ? LED_ON_MSG_MILLIS : LED_ON_MILLIS;
+        next_change = cur_time + last_increment;
+        break;
+      case 1:   // first pulse ends
+        if (gps_beat) {
+          state = 2;
+          next_change = cur_time + LED_GAP_MILLIS;
+        } else {
+          state = 0;
+          next_change = cur_time + LED_CYCLE_MILLIS - last_increment;
+        }
+        break;
+      case 2:   // gap ends -> light the second pulse
+        state = 3;
+        next_change = cur_time + LED_ON_MILLIS;
+        break;
+      default:  // second pulse ends -> dark for the rest of the cycle
+        state = 0;
+        next_change = cur_time + LED_CYCLE_MILLIS - (2 * LED_ON_MILLIS + LED_GAP_MILLIS);
+        break;
     }
-    digitalWrite(PIN_STATUS_LED, state == LED_STATE_ON);
+    // digitalWrite takes HIGH/LOW. LED_STATE_ON lives in the board variant;
+    // fall back the way ui-tiny/ui-new do when a board does not define it.
+    bool lit = (state == 1 || state == 3);
+#ifdef LED_STATE_ON
+    digitalWrite(PIN_STATUS_LED, lit == (LED_STATE_ON == HIGH) ? HIGH : LOW);
+#else
+    digitalWrite(PIN_STATUS_LED, lit ? HIGH : LOW);
+#endif
   }
 #endif
 }
