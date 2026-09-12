@@ -731,18 +731,36 @@ uint8_t MyMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_tim
       permissions |= (TELEM_PERM_BASE | TELEM_PERM_LOCATION);
     }
 
-    // Poll-renewed GPS lease: a renewable lease (!gps on) is refreshed by
-    // every LOC telemetry poll from that requester, so the friend's GPS
-    // stays on while the finder's watch keeps polling and sleeps 5 min
-    // after the last poll. Fixed !gps N leases keep their explicit window.
+    // Poll-renewed GPS lease: a renewable lease (!gps on, or auto-armed
+    // below) is refreshed by every LOC telemetry poll from that requester,
+    // so the friend's GPS stays on while the finder's watch keeps polling
+    // and sleeps 5 min after the last poll. Fixed !gps N leases keep their
+    // explicit window.
     if (permissions & TELEM_PERM_LOCATION) {
       uint8_t rprefix[7]; memcpy(rprefix, contact.id.pub_key, 7);
+      int slot = -1;
       for (int i = 0; i < MAX_GPS_LEASES; i++) {
-        if (gpsLeases[i].used && gpsLeases[i].renewable && memcmp(gpsLeases[i].prefix, rprefix, 7)==0) {
-          gpsLeases[i].endsAt = millis() + GPS_POLL_RENEW_MS;
-          break;
-        }
+        if (gpsLeases[i].used && memcmp(gpsLeases[i].prefix, rprefix, 7)==0) { slot = i; break; }
       }
+      if (slot != -1 && gpsLeases[slot].renewable) {
+        gpsLeases[slot].endsAt = millis() + GPS_POLL_RENEW_MS;
+      } else if (slot == -1) {
+        // No lease: a permissioned LOC poll is an explicit request for live
+        // position, so arm a renewable lease rather than answering from a
+        // sleeping GPS. Same window as !gps on; !gps off still clears it
+        // (the next poll re-arms, which is the requester's stated intent).
+        int free = -1;
+        for (int i = 0; i < MAX_GPS_LEASES; i++) if (!gpsLeases[i].used) { free = i; break; }
+        if (free == -1) free = 0;
+        memcpy(gpsLeases[free].prefix, rprefix, 7);
+        gpsLeases[free].endsAt = millis() + GPS_POLL_RENEW_MS;
+        gpsLeases[free].renewable = true;
+        gpsLeases[free].used = true;
+        strncpy(gpsLeases[free].name, contact.name, sizeof(gpsLeases[free].name)-1);
+        sensors.setSettingValue("gps", "1");
+        MESH_DEBUG_PRINTLN("gps auto-armed (poll) for %s", contact.name);
+      }
+      // Fixed-window (!gps N) leases are left alone: their explicit window wins.
     }
 
     if (permissions & TELEM_PERM_BASE) { // only respond if base permission bit is set
