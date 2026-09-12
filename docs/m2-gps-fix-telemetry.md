@@ -150,20 +150,38 @@ each use.
 
 ## GPS state on the status LED (t1000-e)
 
-The t1000-e's single status LED (`PIN_STATUS_LED=24`, `LED_STATE_ON=HIGH`)
-normally gives one 20 ms flash per 4 s heartbeat cycle (`ui-orig`). While the
-node's GPS is powered the heartbeat **double-pulses** — on at 0–20 ms, dark
-gap 160 ms, on again 180–200 ms, dark for the rest of the cycle — so GPS state
-is readable on any cycle, not only at the instant it is switched on.
+The t1000-e's single status LED (`PIN_STATUS_LED=24`, `LED_STATE_ON=HIGH`) has
+one colour, so GPS state is reported by **pulse count** in the 4 s `ui-orig`
+heartbeat:
+
+| Pulses | Meaning |
+|---|---|
+| 1 | GPS off |
+| 2 | GPS powered, no fix yet |
+| 3 | GPS powered, fix held |
+
+Pulses are 20 ms lit with a 160 ms dark gap between them, and the trailing dark
+period is computed from what the beat actually consumed, so the cycle stays 4 s.
+The beat is sampled as it starts, so its shape cannot change part way through.
+GPS state is therefore readable on any cycle, not only at the instant GPS is
+switched on.
 
 - Only boards on the single-LED path are affected (`#elif defined(PIN_STATUS_LED)`
-  in `ui-orig/UITask.cpp`); RGB boards (`STATUS_LED_RGB`) are untouched.
-- GPS state is read from `SensorManager::getSettingByKey("gps")`, the same
-  `"1"`/`"0"` value `T1000SensorManager::getSettingValue` exposes, so no new
-  coupling to board internals.
+  in `ui-orig/UITask.cpp`); RGB boards (`STATUS_LED_RGB`) are untouched and have
+  no equivalent yet.
+- Both inputs come from the generic `SensorManager` interface: GPS enabled from
+  `getSettingByKey("gps")` (the same `"1"`/`"0"` `T1000SensorManager::getSettingValue`
+  exposes), lock state from `getLocationProvider()->isValid()` — MicroNMEA's GGA
+  fix-quality flag (`'1'`–`'5'` = valid, `MicroNMEA.cpp:323`), the same signal the
+  t1000-e target already uses to publish position. So no new coupling to board
+  internals.
+- Caveat: `isValid()` only refreshes while sentences are being parsed. A receiver
+  that goes quiet leaves its last value in place, so a hung module can read as
+  "fix held". Acceptable for an indicator; it is the same staleness that makes it
+  unusable as a freshness signal over the air.
 - Unread messages keep their long single 200 ms flash and take priority; the
-  double beat only appears on the idle cycle.
-- This supersedes the earlier transient double-flash inside
+  GPS counts only appear on the idle cycle.
+- This supersedes the transient double-flash inside
   `T1000SensorManager::start_gps()` (commit `4985e7dd`): it fired only at the
   moment of enable, was easy to miss, and blocked the command handler for
   480 ms.
