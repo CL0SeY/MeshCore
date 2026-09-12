@@ -660,7 +660,7 @@ firmware's `querySensors` path:
 | Voltage  | 0x74 | 2 B       | Battery voltage × 100                     |
 | GPS      | 0x88 | 9 B       | lat (3 B, ×10000°), lon, alt              |
 | UnixTime | 0x85 | 4 B       | Provider fix time, seconds since epoch     |
-| GenSensor| 0x64 | 4 B       | Satellite count (float, cast to integer)   |
+| GenSensor| 0x64 | 4 B       | Satellite count, big-endian uint32         |
 
 The remaining channels (2+) hold per-board environment sensor entries
 (temperature, humidity, pressure, etc.) in whatever order the board's
@@ -679,10 +679,14 @@ present) timestamps the live provider fix, not necessarily the override
 coordinates.
 
 **0x64 semantics.** The satellite count is the provider's current
-`satellitesCount()` value, emitted whenever GPS is active. On GPS-less
+`satellitesCount()` value, emitted whenever GPS is active, encoded as a
+big-endian **uint32** — even though the call site passes a `float` to
+`addGenericSensor`, the library writes the raw integer bytes (multiplier 1),
+so decoders must read uint32, not float bits. On GPS-less
 sleep or an older firmware it is absent. On some providers the count is
 updated only when a valid fix is held (so reports zero while searching,
-which is the intended "0 sats, no fix" diagnosis signal).
+which is the intended "0 sats, no fix" diagnosis signal). Full encoding and
+board-difference notes: `docs/m2-gps-fix-telemetry.md`.
 
 ### Parsing Responses
 
