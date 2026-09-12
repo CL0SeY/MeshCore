@@ -133,8 +133,14 @@ own self-telemetry polls (`CMD_SEND_TELEMETRY_REQ`, len 4) renew it via
 `renewLocalGpsLease()`, so local GPS lingers warm for 5 min after the last
 poll instead of cutting off on an immediate `gps:0`. Remote triggers and the
 auto-arm path never take or evict slot 0 (they scan from slot 1 and evict
-slot 1 when full). The watch no longer sends `gps:0` at all — no backwards
-compatibility is kept, pre-lease firmware is out of scope.
+slot 1 when full). The watch no longer sends `gps:0` at all, so that path is
+no longer load-bearing for the watch; pre-lease firmware is out of scope.
+
+The node-side guard in `handleCmdFrame` (`CMD_SET_CUSTOM_VAR`) is
+deliberately **kept**: a `gps:0` arriving while any lease is active is
+ignored rather than clearing `_prefs.gps_enabled`. That is the only backwards
+compatibility retained, and it is what stops a build that still sends `gps:0`
+from cutting a live lease short.
 
 Why this exists: the receiver cold-starts on every session when the watch
 cuts power immediately, so reacquire takes longest exactly when the wearer
