@@ -126,21 +126,74 @@ LOC telemetry request with **no** existing lease now auto-arms a renewable
 one (same 5-min window) instead of answering from a sleeping GPS — one-shot
 polls from apps just work, no `!gps` DM needed first. Fixed-window leases
 are never overwritten by polls. Expiry is swept in `updateGpsLeases()`;
-with no leases left, `reconcileGpsFromLeases` sleeps the hardware.
+with no leases left, `reconcileGpsFromLeases` sleeps the hardware unless the
+policy is `on` (see `gps_policy` below).
 
 Slot 0 (`LOCAL_GPS_LEASE_SLOT`) is reserved for the LOCAL lease: the watch's
 own self-telemetry polls (`CMD_SEND_TELEMETRY_REQ`, len 4) renew it via
 `renewLocalGpsLease()`, so local GPS lingers warm for 5 min after the last
 poll instead of cutting off on an immediate `gps:0`. Remote triggers and the
 auto-arm path never take or evict slot 0 (they scan from slot 1 and evict
-slot 1 when full). The watch no longer sends `gps:0` at all, so that path is
-no longer load-bearing for the watch; pre-lease firmware is out of scope.
+slot 1 when full). The watch sends `gps:0` only as an explicit ask (the
+force-off compensation or the wearer's "turn node GPS off"); standing intent
+travels as `gps_policy` below.
 
-The node-side guard in `handleCmdFrame` (`CMD_SET_CUSTOM_VAR`) is
-deliberately **kept**: a `gps:0` arriving while any lease is active is
-ignored rather than clearing `_prefs.gps_enabled`. That is the only backwards
-compatibility retained, and it is what stops a build that still sends `gps:0`
-from cutting a live lease short.
+Under `powersave`, a `gps:0` arriving while any lease is active is ignored
+rather than powering the receiver down or clearing `_prefs.gps_enabled` — the
+retained backwards compatibility that stops a build which still sends `gps:0`
+from cutting a live lease short. Under `on` or `off`, explicit `gps:0`
+applies immediately.
+
+## `gps_policy` (persistent intent)
+
+Companion builds with `ENV_INCLUDE_GPS=1` append `,gps_policy:<value>` to the
+`CMD_GET_CUSTOM_VARS` reply whenever the settings they enumerated included a
+readable `gps` key (and the reply's 140-char body budget still allows it), and
+they accept `SET_CUSTOM_VAR "gps_policy" "<value>"` with `off|powersave|on`;
+the value persists in `NodePrefs.gps_policy` (JSON key `pol`). So the pair
+`gps` + `gps_policy` is the companion's "Full capability" signal, and a board
+whose receiver was never detected (an ESP32/nRF build without a GPS module)
+advertises neither key and stays remote-GPS-uncontrolled; the t1000-e always
+exposes `gps`. `gps:0|1` remains the transient power token.
+
+| Policy | sweep on lease-zero | `gps:0` (down-ask) | `gps:1` (up-ask) | new leases |
+|---|---|---|---|---|
+| `on` | never sleeps | applied now (re-arm needs a later request) | applied | taken |
+| `powersave` (default; also the no-key value for existing nodes) | sleeps | ignored while a lease is active, else applied | applied | taken |
+| `off` | sleeps regardless of leases | applied regardless of leases | applied (explicit command) | refused (`!gps`, LOC polls, self-telemetry) |
+
+A `gps_policy=off` write itself powers the receiver down and clears every
+lease (a reconnect sync sends no `gps:0` to hang it on, and a hold that
+survived `off` would block a later `powersave` flip's down-ask), and it is
+authoritative when it comes from a second client: the connected watch's next
+asks are refused and its reply carries the off receiver, rather than the two
+writers fighting. A `gps_policy=on` write powers it up (the mirror of `off`);
+a `gps_policy=powersave` write releases power instead — with no lease live it
+sleeps the receiver and clears `gps_enabled`, because that is the only chance
+to (the sweep runs only when a lease expires) and the powersave boot fallback
+would otherwise re-arm it after every reboot, which is how leaving Always on
+used to leave the radio running forever. With a lease live it releases
+nothing: the lease is the standing reason for power, so power and the mirror
+are left as they are and the expiry sleep ends it — which means a reboot
+inside such a window still arms through the powersave fallback until the next
+unleased policy write (a watch connect sync does one). Explicit power asks
+always win: on the BLE companion protocol the `'gps'` sensor setting is
+reachable through `SET_CUSTOM_VAR` (`0x29`, `key:value`), the same command
+MeshCoreKmp exposes as `DeviceConnection.setCustomVar`; the exact phone-app UI
+control that issues it is client-specific (unverified — confirm first). Under
+`off`, therefore, a client's bare `gps:1` arms the receiver, while `off` still
+refuses leases and boot-time power. That armed state lapses at the next reboot
+or `gps_policy=off` re-assert unless the client writes the policy, and only
+`gps_policy=on` is the durable override for an armed receiver: a
+`gps_policy=powersave` write releases it instead (it powers down immediately
+when no lease is live, see above). Boot derives power from the policy via
+`applyGpsPrefs()`: `on` arms even when `gps_enabled=0`, `off` sleeps even when
+it is 1, `powersave` falls back to `gps_enabled`. `gps_enabled` keeps being
+persisted as the legacy power mirror (node UI screens read it) but is no
+longer intent. Explicit on-device writes (node UI toggle, `CommonCLI`
+`gps on|off` on text-CLI builds) are not policy-aware — a person at the node
+outranks remote intent, and the next policy write or boot re-asserts the
+policy.
 
 Why this exists: the receiver cold-starts on every session when the watch
 cuts power immediately, so reacquire takes longest exactly when the wearer

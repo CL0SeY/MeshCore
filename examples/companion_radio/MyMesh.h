@@ -173,7 +173,12 @@ public:
 
 #if ENV_INCLUDE_GPS == 1
   void applyGpsPrefs() {
-    sensors.setSettingValue("gps", _prefs.gps_enabled ? "1" : "0");
+    // The persistent policy is the intent; gps_enabled is the legacy power
+    // mirror it falls back to while the policy is powersave.
+    bool power = _prefs.gps_enabled != 0;
+    if (_prefs.gps_policy == GPS_POLICY_ON) power = true;
+    else if (_prefs.gps_policy == GPS_POLICY_OFF) power = false;
+    sensors.setSettingValue("gps", power ? "1" : "0");
     if (_prefs.gps_interval > 0) {
       char interval_str[12];  // Max: 24 hours = 86400 seconds (5 digits + null)
       sprintf(interval_str, "%u", _prefs.gps_interval);

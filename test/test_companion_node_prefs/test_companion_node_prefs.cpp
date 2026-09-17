@@ -77,6 +77,29 @@ TEST(CompanionNodePrefs, RxGainSettingsRoundTripIndependently) {
 }
 #endif
 
+TEST(CompanionNodePrefs, GpsPolicyPersistsAndDefaultsToPowersave) {
+  NodePrefs fresh;
+  EXPECT_EQ(GPS_POLICY_POWERSAVE, fresh.gps_policy);   // absent key = pre-policy behaviour
+
+  fresh.gps_policy = GPS_POLICY_ON;
+  CaptureStream output;
+  ASSERT_TRUE(fresh.saveSerial(output));
+  EXPECT_NE(std::string::npos, output.text().find("pol:2"));
+
+  ReplayStream input("{gps:{pol:0}}");
+  NodePrefs loaded;                                    // default is overridden by the key
+  ASSERT_TRUE(loaded.loadSerial(input));
+  EXPECT_EQ(GPS_POLICY_OFF, loaded.gps_policy);
+
+  // An upgraded node's pre-policy /prefs.json has no `pol`: the GPS section
+  // still loads, and the policy keeps the pre-policy lease-driven default.
+  ReplayStream legacy("{gps:{en:1}}");
+  NodePrefs upgraded;
+  ASSERT_TRUE(upgraded.loadSerial(legacy));
+  EXPECT_EQ(GPS_POLICY_POWERSAVE, upgraded.gps_policy);
+  EXPECT_EQ(1, upgraded.gps_enabled);
+}
+
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

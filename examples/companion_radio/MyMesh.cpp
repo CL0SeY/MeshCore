@@ -548,6 +548,23 @@ void MyMesh::onSignedMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uin
   queueMessage(from, TXT_TYPE_SIGNED_PLAIN, pkt, sender_timestamp, sender_prefix, 4, text);
 }
 
+#if ENV_INCLUDE_GPS == 1
+static const char* gpsPolicyName(uint16_t policy) {
+  switch (policy) {
+    case GPS_POLICY_OFF: return "off";
+    case GPS_POLICY_ON:  return "on";
+    default:             return "powersave";
+  }
+}
+
+static bool gpsPolicyFromName(const char* name, uint16_t& out) {
+  if (strcmp(name, "off") == 0) { out = GPS_POLICY_OFF; return true; }
+  if (strcmp(name, "on") == 0) { out = GPS_POLICY_ON; return true; }
+  if (strcmp(name, "powersave") == 0) { out = GPS_POLICY_POWERSAVE; return true; }
+  return false;
+}
+#endif
+
 bool MyMesh::handleGpsTrigger(const ContactInfo &from, const char *text) {
   if (!text) return false;
   while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') text++;
@@ -577,6 +594,9 @@ bool MyMesh::handleGpsTrigger(const ContactInfo &from, const char *text) {
     }
     reconcileGpsFromLeases();
     return true;
+  } else if (_prefs.gps_policy == GPS_POLICY_OFF) {
+    MESH_DEBUG_PRINTLN("gps lease refused (policy off) for %s", from.name);
+    return true;   // consumed, no lease, no power write — same shape as before
   } else {
     // !gps on arms a poll-renewed lease (expires 5 min after the last LOC
     // telemetry poll from this requester); !gps N keeps its fixed window.
@@ -606,7 +626,17 @@ bool MyMesh::handleGpsTrigger(const ContactInfo &from, const char *text) {
 
 void MyMesh::reconcileGpsFromLeases() {
   bool any = false; for (int i=0;i<MAX_GPS_LEASES;i++) if (gpsLeases[i].used) { any = true; break; }
-  if (!any) { sensors.setSettingValue("gps", "0"); MESH_DEBUG_PRINTLN("gps off (no leases)"); }
+  if (_prefs.gps_policy == GPS_POLICY_ON) {
+    if (!any) MESH_DEBUG_PRINTLN("gps stays on (policy on, no leases)");
+    return;   // Always on: the wearer's intent outlives the last lease
+  }
+  if (_prefs.gps_policy == GPS_POLICY_OFF) {
+    sensors.setSettingValue("gps", "0");   // Always off: leases cannot hold power
+    MESH_DEBUG_PRINTLN("gps off (policy off)");
+  } else if (!any) {
+    sensors.setSettingValue("gps", "0");
+    MESH_DEBUG_PRINTLN("gps off (no leases)");
+  }
 }
 
 void MyMesh::updateGpsLeases() {
@@ -624,6 +654,10 @@ void MyMesh::updateGpsLeases() {
 // of the watch cutting power with an immediate gps:0. Arms the lease on first
 // use so no explicit opt-in is needed over BLE.
 void MyMesh::renewLocalGpsLease() {
+  if (_prefs.gps_policy == GPS_POLICY_OFF) {
+    MESH_DEBUG_PRINTLN("gps local lease refused (policy off)");
+    return;
+  }
   GpsLease &slot = gpsLeases[LOCAL_GPS_LEASE_SLOT];
   if (!slot.used) {
     memcpy(slot.prefix, self_id.pub_key, 7);
@@ -757,32 +791,38 @@ uint8_t MyMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_tim
     // and sleeps 5 min after the last poll. Fixed !gps N leases keep their
     // explicit window.
     if (permissions & TELEM_PERM_LOCATION) {
-      uint8_t rprefix[7]; memcpy(rprefix, contact.id.pub_key, 7);
-      int slot = -1;
-      for (int i = LOCAL_GPS_LEASE_SLOT + 1; i < MAX_GPS_LEASES; i++) {
-        if (gpsLeases[i].used && memcmp(gpsLeases[i].prefix, rprefix, 7)==0) { slot = i; break; }
+      if (_prefs.gps_policy == GPS_POLICY_OFF) {
+        // Always off: a poll cannot power the receiver, so no lease and no
+        // gps:1 — the reply carries whatever the receiver already has.
+        MESH_DEBUG_PRINTLN("gps lease refused (policy off) for %s", contact.name);
+      } else {
+        uint8_t rprefix[7]; memcpy(rprefix, contact.id.pub_key, 7);
+        int slot = -1;
+        for (int i = LOCAL_GPS_LEASE_SLOT + 1; i < MAX_GPS_LEASES; i++) {
+          if (gpsLeases[i].used && memcmp(gpsLeases[i].prefix, rprefix, 7)==0) { slot = i; break; }
+        }
+        if (slot != -1 && gpsLeases[slot].renewable) {
+          gpsLeases[slot].endsAt = millis() + GPS_POLL_RENEW_MS;
+        } else if (slot == -1) {
+          // No lease: a permissioned LOC poll is an explicit request for live
+          // position, so arm a renewable lease rather than answering from a
+          // sleeping GPS. Same window as !gps on; !gps off still clears it
+          // (the next poll re-arms, which is the requester's stated intent).
+          // Slot 0 is the LOCAL lease (the watch's own polls) — never take or
+          // evict it for a remote requester.
+          int free = -1;
+          for (int i = LOCAL_GPS_LEASE_SLOT + 1; i < MAX_GPS_LEASES; i++) if (!gpsLeases[i].used) { free = i; break; }
+          if (free == -1) free = LOCAL_GPS_LEASE_SLOT + 1;
+          memcpy(gpsLeases[free].prefix, rprefix, 7);
+          gpsLeases[free].endsAt = millis() + GPS_POLL_RENEW_MS;
+          gpsLeases[free].renewable = true;
+          gpsLeases[free].used = true;
+          strncpy(gpsLeases[free].name, contact.name, sizeof(gpsLeases[free].name)-1);
+          sensors.setSettingValue("gps", "1");
+          MESH_DEBUG_PRINTLN("gps auto-armed (poll) for %s", contact.name);
+        }
+        // Fixed-window (!gps N) leases are left alone: their explicit window wins.
       }
-      if (slot != -1 && gpsLeases[slot].renewable) {
-        gpsLeases[slot].endsAt = millis() + GPS_POLL_RENEW_MS;
-      } else if (slot == -1) {
-        // No lease: a permissioned LOC poll is an explicit request for live
-        // position, so arm a renewable lease rather than answering from a
-        // sleeping GPS. Same window as !gps on; !gps off still clears it
-        // (the next poll re-arms, which is the requester's stated intent).
-        // Slot 0 is the LOCAL lease (the watch's own polls) — never take or
-        // evict it for a remote requester.
-        int free = -1;
-        for (int i = LOCAL_GPS_LEASE_SLOT + 1; i < MAX_GPS_LEASES; i++) if (!gpsLeases[i].used) { free = i; break; }
-        if (free == -1) free = LOCAL_GPS_LEASE_SLOT + 1;
-        memcpy(gpsLeases[free].prefix, rprefix, 7);
-        gpsLeases[free].endsAt = millis() + GPS_POLL_RENEW_MS;
-        gpsLeases[free].renewable = true;
-        gpsLeases[free].used = true;
-        strncpy(gpsLeases[free].name, contact.name, sizeof(gpsLeases[free].name)-1);
-        sensors.setSettingValue("gps", "1");
-        MESH_DEBUG_PRINTLN("gps auto-armed (poll) for %s", contact.name);
-      }
-      // Fixed-window (!gps N) leases are left alone: their explicit window wins.
     }
 
     if (permissions & TELEM_PERM_BASE) { // only respond if base permission bit is set
@@ -1081,6 +1121,7 @@ void MyMesh::begin(bool has_display) {
   _prefs.tx_power_dbm = constrain(_prefs.tx_power_dbm, -9, MAX_LORA_TX_POWER);
   _prefs.gps_enabled = constrain(_prefs.gps_enabled, 0, 1);  // Ensure boolean 0 or 1
   _prefs.gps_interval = constrain(_prefs.gps_interval, 0, 86400);  // Max 24 hours
+  if (_prefs.gps_policy > GPS_POLICY_ON) _prefs.gps_policy = GPS_POLICY_POWERSAVE;  // corrupt value: keep pre-policy behaviour
 
 #ifdef BLE_PIN_CODE // 123456 by default
   if (_prefs.ble_pin == 0) {
@@ -1952,6 +1993,24 @@ void MyMesh::handleCmdFrame(size_t len) {
       strcpy(dp, sensors.getSettingValue(i));
       dp = strchr(dp, 0);
     }
+    #if ENV_INCLUDE_GPS == 1
+    // gps_policy is MyMesh-owned intent, not a variant setting, so it is
+    // appended rather than enumerated — but only beside a readable `gps` key:
+    // the pair is the companion's Full capability advertisement, so a
+    // policy-only reply (no detected GPS) must not carry it.
+    bool gps_key = false;
+    for (int i = 0; i < sensors.getNumSettings(); i++) {
+      const char *name = sensors.getSettingName(i);
+      if (name != NULL && strcmp(name, "gps") == 0) { gps_key = true; break; }
+    }
+    if (gps_key && dp - (char *)&out_frame[1] < 140) {
+      *dp++ = ',';
+      strcpy(dp, "gps_policy:");
+      dp = strchr(dp, 0);
+      strcpy(dp, gpsPolicyName(_prefs.gps_policy));
+      dp = strchr(dp, 0);
+    }
+    #endif
     _serial->writeFrame(out_frame, dp - (char *)out_frame);
   } else if (cmd_frame[0] == CMD_SET_CUSTOM_VAR && len >= 4) {
     cmd_frame[len] = 0;
@@ -1959,29 +2018,91 @@ void MyMesh::handleCmdFrame(size_t len) {
     char *np = strchr(sp, ':'); // look for separator char
     if (np) {
       *np++ = 0; // modify 'cmd_frame', replace ':' with null
-      bool success = sensors.setSettingValue(sp, np);
-      if (success) {
-        #if ENV_INCLUDE_GPS == 1
-        if (strcmp(sp, "gps") == 0) {
-          if (np[0] == '0') {
-            bool leasesActive = false; for (int i=0;i<MAX_GPS_LEASES;i++) if (gpsLeases[i].used) { leasesActive=true; break; }
-            if (leasesActive) {
-              MESH_DEBUG_PRINTLN("gps:0 from watch ignored (leases active)");
-              writeOKFrame();
-            } else { _prefs.gps_enabled = 0; savePrefs(); writeOKFrame(); }
-          } else { _prefs.gps_enabled = 1; savePrefs(); writeOKFrame(); }
-        } else if (strcmp(sp, "gps_interval") == 0) {
-          uint32_t interval_seconds = atoi(np);
-          _prefs.gps_interval = constrain(interval_seconds, 0, 86400);
+      #if ENV_INCLUDE_GPS == 1
+      if (strcmp(sp, "gps") == 0) {
+        // Power token. Explicit `gps:1` and `gps:0` always win over the
+        // policy's standing behaviour: `gps:1` powers on even under policy
+        // `off`, `gps:0` powers down now even under policy `on`. The only
+        // down-ask that does not apply is under `powersave` with a live
+        // lease, where the lessee's poll window owns power.
+        if (np[0] == '0') {
+          bool leasesActive = false; for (int i=0;i<MAX_GPS_LEASES;i++) if (gpsLeases[i].used) { leasesActive = true; break; }
+          if (leasesActive && _prefs.gps_policy == GPS_POLICY_POWERSAVE) {
+            MESH_DEBUG_PRINTLN("gps:0 from watch ignored (leases active)");
+            writeOKFrame();
+          } else if (sensors.setSettingValue("gps", "0")) {
+            _prefs.gps_enabled = 0; savePrefs(); writeOKFrame();
+          } else {
+            writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+          }
+        } else if (sensors.setSettingValue("gps", "1")) {
+          _prefs.gps_enabled = 1; savePrefs(); writeOKFrame();
+        } else {
+          writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+        }
+      } else if (strcmp(sp, "gps_policy") == 0) {
+        uint16_t policy;
+        if (gpsPolicyFromName(np, policy)) {
+          _prefs.gps_policy = policy;
+          if (policy == GPS_POLICY_OFF) {
+            // Intent lands as power-down: the paired gps:0 may have been
+            // ignored under the previous policy, and a reconnect sync sends
+            // no power write at all. Every hold dies with it — a lease that
+            // survived off would block a later powersave flip's down-ask.
+            for (int i = 0; i < MAX_GPS_LEASES; i++) gpsLeases[i].used = false;
+            sensors.setSettingValue("gps", "0");
+            _prefs.gps_enabled = 0;
+            MESH_DEBUG_PRINTLN("gps_policy=off: receiver down");
+          } else if (policy == GPS_POLICY_ON) {
+            // Mirror of off: the policy write itself re-asserts intent as
+            // power, so a reconnect sync with no `gps:1` behind it still
+            // arms the receiver.
+            sensors.setSettingValue("gps", "1");
+            _prefs.gps_enabled = 1;
+            MESH_DEBUG_PRINTLN("gps_policy=on: receiver armed");
+          } else {
+            // powersave: power follows leases, so this write is what ends an
+            // `on` hold (Always on -> When needed) or any explicit power write:
+            // none of them leaves a lease behind, and the sweep only runs when
+            // a lease expires — so without this the receiver stays powered with
+            // nothing able to sleep it. The mirror is cleared with it because
+            // it cannot be trusted as a power indicator (the F4 boot arm and
+            // the sweep both change power without updating it), and leaving it
+            // set lets the powersave boot fallback re-arm the receiver.
+            bool leased = false;
+            for (int i = 0; i < MAX_GPS_LEASES; i++) if (gpsLeases[i].used) { leased = true; break; }
+            if (!leased) {
+              sensors.setSettingValue("gps", "0");   // idempotent: GPIO/stop() on every variant
+              _prefs.gps_enabled = 0;
+              MESH_DEBUG_PRINTLN("gps_policy=powersave: receiver off (no leases)");
+            }
+          }
           savePrefs();
           writeOKFrame();
-        } else { writeOKFrame(); }
-        #else
+        } else {
+          writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+        }
+      } else {
+        bool success = sensors.setSettingValue(sp, np);
+        if (success) {
+          if (strcmp(sp, "gps_interval") == 0) {
+            uint32_t interval_seconds = atoi(np);
+            _prefs.gps_interval = constrain(interval_seconds, 0, 86400);
+            savePrefs();
+          }
+          writeOKFrame();
+        } else {
+          writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+        }
+      }
+      #else
+      bool success = sensors.setSettingValue(sp, np);
+      if (success) {
         writeOKFrame();
-        #endif
       } else {
         writeErrFrame(ERR_CODE_ILLEGAL_ARG);
       }
+      #endif
     } else {
       writeErrFrame(ERR_CODE_ILLEGAL_ARG);
     }

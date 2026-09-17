@@ -9,6 +9,13 @@
 #define ADVERT_LOC_NONE       0
 #define ADVERT_LOC_SHARE      1
 
+// Persistent GPS intent, written by a companion as `gps_policy` and advertised
+// in CMD_GET_CUSTOM_VARS. `gps:0|1` stays the transient power token; this
+// survives reboots and lease sweeps.
+#define GPS_POLICY_OFF        0  // Always off: not even a lease powers the receiver
+#define GPS_POLICY_POWERSAVE  1  // default: lease-driven (pre-policy behaviour)
+#define GPS_POLICY_ON         2  // Always on: lease-zero never sleeps
+
 class NodePrefs : public ConfigSerializer {  // persisted to file
 public:
   float airtime_factor = 0;
@@ -31,6 +38,7 @@ public:
   uint8_t  vibe_quiet = 0;
   uint8_t  gps_enabled = 0;      // GPS enabled flag (0=disabled, 1=enabled)
   uint32_t gps_interval = 0;     // GPS read interval in seconds
+  uint16_t gps_policy = GPS_POLICY_POWERSAVE;  // persistent intent (off|powersave|on); wide so a corrupt `pol` (e.g. 258) is still visible to the sanitiser
   uint8_t autoadd_config = 0;    // bitmask for auto-add contacts config
   uint8_t rx_boosted_gain = 0; // SX126x RX boosted gain mode (0=power saving, 1=boosted)
   uint8_t radio_fem_rxgain = 0; // external LoRa FEM RX gain (LNA)
@@ -80,6 +88,7 @@ private:
       def("en", _parent->gps_enabled); // boolean
       def("int", _parent->gps_interval);   // interval in seconds
       def("adv_loc", _parent->advert_loc_policy);
+      def("pol", _parent->gps_policy);   // appended key; existing keys/offsets unchanged
     }
   public:
     GPSPrefs(NodePrefs* parent) : _parent(parent) { }
