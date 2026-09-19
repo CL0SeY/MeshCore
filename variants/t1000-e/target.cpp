@@ -2,6 +2,7 @@
 #include "t1000e_sensors.h"
 #include "target.h"
 #include <helpers/sensors/MicroNMEALocationProvider.h>
+#include <helpers/sensors/GpsTelemetry.h>
 
 T1000eBoard board;
 
@@ -137,6 +138,7 @@ bool T1000SensorManager::begin() {
 bool T1000SensorManager::querySensors(uint8_t requester_permissions, CayenneLPP& telemetry) {
   if (requester_permissions & TELEM_PERM_LOCATION) {   // does requester have permission?
     telemetry.addGPS(TELEM_CHANNEL_SELF, node_lat, node_lon, node_altitude);
+    addGpsFixTelemetry(telemetry, _nmea, gps_active);
   }
   if (requester_permissions & TELEM_PERM_ENVIRONMENT) {
     // Firmware reports light as a 0-100 % scale, but expose it via Luminosity so app labels it "Luminosity".
@@ -158,7 +160,7 @@ void T1000SensorManager::loop() {
       node_altitude = ((double)_nmea->getAltitude()) / 1000.0;
       //Serial.printf("lat %f lon %f\r\n", _lat, _lon);
     }
-    next_gps_update = millis() + 1000;
+    next_gps_update = millis() + (gps_update_interval_sec * 1000);
   }
 }
 
@@ -180,6 +182,12 @@ bool T1000SensorManager::setSettingValue(const char* name, const char* value) {
     } else {
       start_gps();
     }
+    return true;
+  }
+  if (strcmp(name, "gps_interval") == 0) {
+    uint32_t interval_seconds = atoi(value);
+    gps_update_interval_sec = interval_seconds > 0 ? interval_seconds : 1;
+    if (gps_update_interval_sec > 86400) gps_update_interval_sec = 86400;
     return true;
   }
   return false;  // not supported

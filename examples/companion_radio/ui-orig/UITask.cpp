@@ -10,6 +10,7 @@
 #define LED_ON_MILLIS     20
 #define LED_ON_MSG_MILLIS 200
 #define LED_CYCLE_MILLIS  4000
+#define LED_GAP_MILLIS    160   // dark gap between the two pulses of the GPS beat
 #endif
 
 #if defined(PIN_STATUS_LED_R) && defined(PIN_STATUS_LED_G) && defined(PIN_STATUS_LED_B)
@@ -384,25 +385,70 @@ void UITask::userLedHandler() {
     }
   }
 #elif defined(PIN_STATUS_LED)
-  static int state = 0;
+  static int state = 0;          // 0 dark, 1 pulse lit, 2 gap between pulses
+  static int pulses = 0;         // pulses emitted so far in this beat
+  static int target = 1;         // pulses this beat aims for
+  static int on_ms = LED_ON_MILLIS;  // lit time of this beat's first pulse
   static int next_change = 0;
-  static int last_increment = 0;
+
+  // The heartbeat reports GPS state by pulse count, so it is readable on any
+  // cycle rather than only in the moment GPS is switched on: one flash = GPS
+  // off, two = on but no fix yet, three = on with a fix. Unread messages keep
+  // their long single flash and win. Sampled as a beat starts, so the shape
+  // cannot change part way through one.
+  bool gps_beat = false, gps_locked = false;
+  if (_sensors != NULL && _msgcount == 0) {
+    const char* gps = _sensors->getSettingByKey("gps");
+    gps_beat = gps != NULL && gps[0] == '1';
+    if (gps_beat) {
+      LocationProvider* location = _sensors->getLocationProvider();
+      gps_locked = location != NULL && location->isValid();
+    }
+  }
 
   int cur_time = millis();
   if (cur_time > next_change) {
-    if (state == 0) {
-      state = 1;
-      if (_msgcount > 0) {
-        last_increment = LED_ON_MSG_MILLIS;
-      } else {
-        last_increment = LED_ON_MILLIS;
-      }
-      next_change = cur_time + last_increment;
-    } else {
-      state = 0;
-      next_change = cur_time + LED_CYCLE_MILLIS - last_increment;
+    switch (state) {
+      case 0:   // dark -> start a beat
+        on_ms = LED_ON_MILLIS;
+        if (_msgcount > 0) {
+          target = 1;
+          on_ms = LED_ON_MSG_MILLIS;
+        } else if (gps_beat) {
+          target = gps_locked ? 3 : 2;
+        } else {
+          target = 1;
+        }
+        pulses = 1;
+        state = 1;
+        next_change = cur_time + on_ms;
+        break;
+      case 1:   // a pulse ended
+        if (pulses < target) {
+          state = 2;                        // dark gap before the next pulse
+          next_change = cur_time + LED_GAP_MILLIS;
+        } else {
+          state = 0;                        // dark for the rest of the cycle
+          // Subtract what the beat has actually consumed: the first pulse may
+          // be the longer message pulse, the rest are always LED_ON_MILLIS.
+          next_change = cur_time + LED_CYCLE_MILLIS -
+                        (on_ms + (target - 1) * (LED_ON_MILLIS + LED_GAP_MILLIS));
+        }
+        break;
+      default:  // a gap ended -> light the next pulse
+        state = 1;
+        pulses++;
+        next_change = cur_time + LED_ON_MILLIS;
+        break;
     }
-    digitalWrite(PIN_STATUS_LED, state == LED_STATE_ON);
+    // digitalWrite takes HIGH/LOW. LED_STATE_ON lives in the board variant;
+    // fall back the way ui-tiny/ui-new do when a board does not define it.
+    bool lit = (state == 1);
+#ifdef LED_STATE_ON
+    digitalWrite(PIN_STATUS_LED, lit == (LED_STATE_ON == HIGH) ? HIGH : LOW);
+#else
+    digitalWrite(PIN_STATUS_LED, lit ? HIGH : LOW);
+#endif
   }
 #endif
 }

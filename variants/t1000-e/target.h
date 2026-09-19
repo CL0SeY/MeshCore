@@ -14,6 +14,7 @@
 
 class T1000SensorManager: public SensorManager {
   bool gps_active = false;
+  uint32_t gps_update_interval_sec = 30;
   LocationProvider * _nmea;
 
   void start_gps();

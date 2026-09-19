@@ -2,6 +2,7 @@
 #include "target.h"
 #include <helpers/ArduinoHelpers.h>
 #include <helpers/sensors/MicroNMEALocationProvider.h>
+#include <helpers/sensors/GpsTelemetry.h>
 
 ThinkNodeM1Board board;
 
@@ -64,6 +65,7 @@ bool ThinkNodeM1SensorManager::begin() {
 bool ThinkNodeM1SensorManager::querySensors(uint8_t requester_permissions, CayenneLPP& telemetry) {
   if (requester_permissions & TELEM_PERM_LOCATION) {   // does requester have permission?
     telemetry.addGPS(TELEM_CHANNEL_SELF, node_lat, node_lon, node_altitude);
+    addGpsFixTelemetry(telemetry, _location, gps_active);
   }
   return true;
 }

@@ -173,7 +173,12 @@ public:
 
 #if ENV_INCLUDE_GPS == 1
   void applyGpsPrefs() {
-    sensors.setSettingValue("gps", _prefs.gps_enabled ? "1" : "0");
+    // The persistent policy is the intent; gps_enabled is the legacy power
+    // mirror it falls back to while the policy is powersave.
+    bool power = _prefs.gps_enabled != 0;
+    if (_prefs.gps_policy == GPS_POLICY_ON) power = true;
+    else if (_prefs.gps_policy == GPS_POLICY_OFF) power = false;
+    sensors.setSettingValue("gps", power ? "1" : "0");
     if (_prefs.gps_interval > 0) {
       char interval_str[12];  // Max: 24 hours = 86400 seconds (5 digits + null)
       sprintf(interval_str, "%u", _prefs.gps_interval);
@@ -203,6 +208,23 @@ private:
   void checkCLIRescueCmd();
   void checkSerialInterface();
   bool isValidClientRepeatFreq(uint32_t f) const;
+
+  // GPS lease manager (firmware-side !gps handling — saves watch wakes).
+  // A "renewable" lease (!gps on) is refreshed by each LOC telemetry poll
+  // from that requester and expires 5 min after the last poll; a fixed
+  // lease (!gps N) keeps its explicit window and is never poll-refreshed.
+  // Slot 0 is reserved for the LOCAL lease: the watch's own self-telemetry
+  // polls renew it the same way, so local GPS lingers warm after a session
+  // instead of cutting off immediately (remote leases use slots 1..N).
+  struct GpsLease { uint8_t prefix[7]; uint32_t endsAt; bool used; bool renewable; char name[24]; };
+  static const int MAX_GPS_LEASES = 4;
+  static const int LOCAL_GPS_LEASE_SLOT = 0;
+  static const uint32_t GPS_POLL_RENEW_MS = 5UL * 60UL * 1000UL;
+  GpsLease gpsLeases[MAX_GPS_LEASES] = {};
+  bool handleGpsTrigger(const ContactInfo &from, const char *text);
+  void reconcileGpsFromLeases();
+  void updateGpsLeases();
+  void renewLocalGpsLease();
 
   // helpers, short-cuts
   void saveChannels() { _store->saveChannels(this); }
