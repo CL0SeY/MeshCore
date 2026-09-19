@@ -666,17 +666,24 @@ The remaining channels (2+) hold per-board environment sensor entries
 (temperature, humidity, pressure, etc.) in whatever order the board's
 active sensors were initialized.
 
-**0x85 semantics.** The unix-time stamp is the `LocationProvider::getTimestamp()`
-value of the provider's most recent valid GNSS fix (synced from NMEA when the
-fix has held for >2 s, or from the u-blox epoch). It is emitted **only** when
-the provider reports a valid fix **and** the clock value passes a lower-bound
-plausibility check (≥ 2020-01-01). An absent 0x85 means either the provider
-had no fix at emit time, the clock was implausible, the firmware predates this
-feature, or the GPS is asleep. The coordinate row (0x88) is emitted without
-this gate and may carry a `CMD_SET_ADVERT_LATLON` override for up to one GPS
-update interval after the override is set — during that window 0x85 (if
-present) timestamps the live provider fix, not necessarily the override
-coordinates.
+**0x88 semantics.** The position row carries the node's own fix — the live row
+while `gps_active`, otherwise the **last-known** position from the node's fix
+memory (cached on position validity, not on the clock). The 7 MicroNMEA
+variants emit a row whenever location permission is granted — their live row
+ungated and, when off, the remembered one — so a variant node that never fixed
+can send a `(0,0)` position: decoder caveat, not a fix age. May carry a
+`CMD_SET_ADVERT_LATLON` override for up to one GPS update interval after the
+override is set — during that window 0x85 (if present) timestamps the live
+provider fix, not necessarily the override coordinates.
+
+**0x85 semantics.** The unix-time stamp is the node's last-known fix time —
+live while the provider reports a valid fix with a plausible clock (synced from
+NMEA when the fix has held for >2 s, or from the u-blox epoch), otherwise the
+remembered fix time. Emitted whenever the remembered or live fix has a plausible
+clock (≥ 2020-01-01), **including while the GPS is asleep or searching** — the
+stamp's age is the liveness signal, so judge by it, never by its presence. An
+absent 0x85 means the node never held a fix, the clock never locked, or the
+firmware predates this feature.
 
 **0x64 semantics.** One packed value carrying both facts: satellite count in
 the high digits, fix wall clock (UTC) in the low six — e.g. `12170330` = 12
@@ -685,11 +692,12 @@ the clock is 0..235959 so it never carries into the count, and a clock of 0
 means either 00:00:00 or no plausible fix. Encoded as a big-endian **uint32**
 even though the call site passes a `float` to `addGenericSensor` — the library
 writes the raw integer bytes (multiplier 1), so decoders must read uint32, not
-float bits. Emitted whenever GPS is active, and also while asleep when a
-cached fix exists (count reads 0 then); absent on GPS-less sleep with no
-cached fix or on older firmware. One entry rather than two because UIs that
-key LPP by `(channel, type)` collapse duplicates. Full encoding and
-board-difference notes: `docs/m2-gps-fix-telemetry.md`.
+float bits. A positive count beside an aged 0x85 means **last-known**, not
+currently tracking — judge liveness by the stamp's age. Emitted whenever GPS is
+active, and also while asleep or searching when a fix was ever remembered;
+absent on GPS-less sleep with no remembered fix or on older firmware. One entry
+rather than two because UIs that key LPP by `(channel, type)` collapse
+duplicates. Full encoding and board-difference notes: `docs/m2-gps-fix-telemetry.md`.
 
 ### Parsing Responses
 

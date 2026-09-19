@@ -15,17 +15,27 @@ Single shared emitter, `src/helpers/sensors/GpsTelemetry.h`
 
 | Entry | Type | Payload on the wire | Emit condition |
 |---|---|---|---|
-| Fix time | UnixTime `0x85` | 4 B big-endian **uint32** seconds since epoch | `location->isValid()` **and** timestamp ≥ 2020-01-01 — **even when GPS is asleep**, so a cached position carries its age |
-| Sats + clock | GenericSensor `0x64` | 4 B big-endian **uint32**, `sats × 10⁶ + HHMMSS` — e.g. `12170330` = 12 sats at 17:03:30 UTC | GPS active, **or** a cached fix exists while asleep (count reads 0 then) |
+| Fix time | UnixTime `0x85` | 4 B big-endian **uint32** seconds since epoch | Live while the provider holds a valid fix with a plausible clock; otherwise the **remembered** fix time — emitted whenever the live or remembered clock is ≥ 2020-01-01, **including while GPS is asleep or searching** (the stamp's age is the liveness signal) |
+| Sats + clock | GenericSensor `0x64` | 4 B big-endian **uint32**, `sats × 10⁶ + HHMMSS` — e.g. `12170330` = 12 sats at 17:03:30 UTC | Live values under a live fix, otherwise the **remembered** `sats × 10⁶ + HHMMSS`; the live count with clock `0` while active with no lock and nothing remembered |
+| Position | GPS `0x88` | lat/lon/alt, caller's row | On both families: the live row while `gps_active`; the **remembered** position (`addCachedGpsPosition`) while off, when a fix was ever cached. The 7 MicroNMEA variants also emit the row on location permission alone (their upstream shape), so a never-fixed node there can send `(0,0)` — pre-existing, not this feature |
 
-Exactly one `0x64` entry, never two. Wire order on channel 1 is `0x85` then
-`0x64`. Nothing is emitted when the provider is null or GPS is asleep with no
-fix ever.
+At most one `0x88`, one `0x85`, one `0x64` per reply. Wire order on channel 1 is
+`0x88` then `0x85` then `0x64`. Reply shapes:
 
-"Stamp absent" means no plausible fix at emit (searching, or never fixed);
-"count reads 0" with a stamp present means the position is cached — judge its
-age from the stamp. Both-absent means provider null, GPS off with no cached
-fix, or pre-M2 firmware.
+| State | `0x88` | `0x85` | `0x64` |
+|---|---|---|---|
+| live fix | live row | live stamp | live `sats × 10⁶ + HHMMSS` |
+| fix remembered, no live fix | remembered row | remembered stamp | remembered `sats × 10⁶ + HHMMSS` |
+| active, no lock, nothing remembered | live row (variants always; ESM while `gps_active`) | — | live count, clock `0` |
+| valid position, clock never plausible | remembered row | — | live count, clock `0` |
+| never fixed and asleep | variants only — `(0,0)` row on location permission | — | — |
+
+"Stamp absent" means the node never held a fix or a plausible clock (searching
+with nothing remembered, or never fixed) — **not** "GPS is asleep". A positive
+count beside an aged stamp means *last-known*, not currently tracking; judge by
+the stamp's age. Both-absent means never fixed and asleep, or pre-M2 firmware.
+"Count reads 0" with a stamp present is legacy M2 firmware behaviour
+(pre-memory); current builds keep the remembered count.
 
 Order on channel 1 is voltage (`0x74`), GPS (`0x88`), then `0x85`, `0x64`
 (the diagnostics ride the same `querySensors` call, right after `addGPS`).
@@ -85,20 +95,28 @@ consumers must judge by stamp **age**, never by stamp presence.
 
 ## Board differences
 
-All boards share `addGpsFixTelemetry`; they differ in provider, position-row
-gating, and what feeds the count.
+All boards share `addGpsFixTelemetry` plus the per-provider last-known-fix
+memory; they differ in provider, position-row gating, and what feeds the count.
 
 | Board family | Provider | Position row (0x88) gating | Sat count source |
 |---|---|---|---|
 | 7 variant managers (t1000-e, meshtracker_x1, thinknode_m1, meshadventurer, nano_g2_ultra, heltec_mesh_solar, heltec_tracker) | `MicroNMEALocationProvider` over serial NMEA | Emitted on location permission alone — present even with GPS off | GGA field 7 via `nmea.getNumSatellites()` (GSV never contributes) |
-| Shared `EnvironmentSensorManager` (ESP32 boards, u-blox/RAK12500 path) | `RAK12500LocationProvider` (`getSIV(2)`, `_sats` zeroed when no fix since M2) | Gated on `gps_active` (`querySensors` checks it) | `getSIV(2)`; `_sats` reset to 0 when the fix drops, so no stale last-fix count |
+| Shared `EnvironmentSensorManager` (ESP32 boards, u-blox/RAK12500 path) | `RAK12500LocationProvider` (`getSIV(2)`); memory cached on `isValid()` | `addCachedGpsPosition` emits the remembered position when off, so the row is present too | Memory keeps the count from the last valid fix; `_sats` resets to 0 live when the fix drops |
 
 Two consequences for decoders:
 
-1. **Position-row presence means different things per board.** On the t1000-e a
-   position row with no diagnostics means GPS is off; on ESP32 boards the same
-   wire state means pre-M2 firmware (their row is `gps_active`-gated). Decoders
-   that cannot identify the board must not assert either cause.
+1. **Position-row presence no longer distinguishes on/off, but diagnostics do.**
+   Both families emit the remembered position row when the receiver is off, so a
+   position row carrying remembered coordinates with no diagnostics means
+   pre-memory firmware; presence vs absence of `0x85`/`0x64` is the version
+   signal. Two current exceptions carry a row without diagnostics: a never-fixed
+   variant node (location permission alone emits its `(0,0)` row), and an asleep
+   fix remembered *without* a plausible clock (`addCachedGpsPosition` emits the
+   row, `addGpsFixTelemetry` returns early). (Historic note: builds before the
+   fix-memory change did differ here — t1000-e emitted the row on location
+   permission alone while ESP32 boards gated it on `gps_active` — so the hedge
+   "No fix held yet, or this node doesn't report health" stays honest for old
+   firmware.)
 2. **t1000-e GNSS is the LR1110** (`variants/t1000-e/target.cpp`, `MODE_GNSS`),
    a snapshot/assisted part. Its GGA sats-in-use field is live (observed 25 on
    clear sky, dropping under cover) — the earlier "sends 0 regardless" claim
@@ -106,15 +124,21 @@ Two consequences for decoders:
 
 ## Tests
 
-`test/test_gps_telemetry/` (9 host-side cases against a recording `CayenneLPP`
-mock in `test/mocks/CayenneLPP.h`) covers the emit conditions and the packing:
-the HHMMSS known vector (17:03:30 UTC ⇒ 170330) and that the clock never
-reaches the modulus, awake-with-fix ⇒ `0x85` + packed `(12, 170330)`,
-awake-without-fix ⇒ packed `(7, 0)`, implausible clock ⇒ `(3, 0)` not garbage,
-asleep-with-cached-fix ⇒ `0x85` + packed `(0, 170330)`, asleep-without-fix and
-null provider ⇒ nothing, and channel-1-only. Note the mock records calls, not
-bytes — a decoder-side regression test with raw wire bytes lives with each
-consumer, not here.
+`test/test_gps_telemetry/` (19 host-side cases against a recording `CayenneLPP`
+mock in `test/mocks/CayenneLPP.h`) covers the emit conditions, the packing, and
+the last-known-fix memory: the HHMMSS known vector (17:03:30 UTC ⇒ 170330) and
+that the clock never reaches the modulus, awake-with-fix ⇒ `0x85` + packed
+`(12, 170330)`, awake-without-fix ⇒ packed `(7, 0)`, implausible clock ⇒
+`(3, 0)` not garbage, asleep-with-cached-fix ⇒ `0x85` + packed `(9, 170330)`
+(the count is retained, not zeroed), searching-after-fix ⇒ the remembered
+`0x85` + `(12, 170330)`, cached-position units and the never-fixed no-row case,
+`gpsFixAvailable` (memory-backed, false when never fixed) and that a read does
+not claim a slot, per-provider memory isolation and the >2-provider eviction
+policy, asleep-without-fix and null provider ⇒ nothing, and channel-1-only. Note
+the mock records calls, not bytes — a decoder-side regression test with raw wire
+bytes lives with each consumer, not here. All cases run under a fixture whose
+`SetUp()` resets the memory, because the tests use stack providers and the slots
+are keyed on provider identity.
 
 ## GPS leases (remote power control)
 

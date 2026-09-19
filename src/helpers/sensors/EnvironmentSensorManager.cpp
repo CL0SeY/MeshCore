@@ -671,10 +671,19 @@ bool EnvironmentSensorManager::querySensors(uint8_t requester_permissions, Cayen
 
   if (requester_permissions & TELEM_PERM_LOCATION && gps_active) {
     telemetry.addGPS(TELEM_CHANNEL_SELF, node_lat, node_lon, node_altitude);
-    #if ENV_INCLUDE_GPS
-    addGpsFixTelemetry(telemetry, _location, gps_active);
-    #endif
   }
+
+  #if ENV_INCLUDE_GPS
+  // Last-known reading: the cached position comes from the memory, not
+  // node_lat — node_lat is only written on the gps_update_interval tick, so it
+  // can lag the poll that first records the fix. _location is null until GPS
+  // init succeeds, hence the guard. The live row above and this cached one are
+  // mutually exclusive on gps_active, so at most one 0x88 is emitted.
+  if (requester_permissions & TELEM_PERM_LOCATION) {
+    if (!gps_active && _location != NULL) addCachedGpsPosition(telemetry, _location);
+    addGpsFixTelemetry(telemetry, _location, gps_active);
+  }
+  #endif
 
   if (requester_permissions & TELEM_PERM_ENVIRONMENT) {
     for (int i = 0; i < _active_sensor_count; i++) {
