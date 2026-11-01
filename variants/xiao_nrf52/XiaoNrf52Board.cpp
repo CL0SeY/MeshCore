@@ -46,9 +46,15 @@ void XiaoNrf52Board::begin() {
 
 #if defined(PIN_WIRE_SDA) && defined(PIN_WIRE_SCL)
   Wire.setPins(PIN_WIRE_SDA, PIN_WIRE_SCL);
+  Wire.begin();
 #endif
 
-  Wire.begin();
+#ifdef GPS_EN_HIGH_DRIVE
+  // Standard pad drive is under 1 mA. H0H1 is the high-drive mode that can
+  // source the GPS rail directly (it sags as the load approaches ~15 mA).
+  pinMode(PIN_GPS_EN, OUTPUT_H0H1);
+  digitalWrite(PIN_GPS_EN, !PIN_GPS_EN_ACTIVE);
+#endif
 
 #ifdef P_LORA_TX_LED
   pinMode(P_LORA_TX_LED, OUTPUT);

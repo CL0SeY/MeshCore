@@ -744,8 +744,45 @@ bool EnvironmentSensorManager::setSettingValue(const char* name, const char* val
 }
 
 #if ENV_INCLUDE_GPS
-void EnvironmentSensorManager::initBasicGPS() {
 
+#if defined(GPS_RELEASE_UART_WHEN_OFF) || defined(GPS_EN_HIGH_DRIVE)
+static void gpsUartBegin() {
+  Serial1.setPins(PIN_GPS_TX, PIN_GPS_RX);
+#ifdef GPS_BAUD_RATE
+  Serial1.begin(GPS_BAUD_RATE);
+#else
+  Serial1.begin(9600);
+#endif
+}
+#endif
+
+#if defined(GPS_RELEASE_UART_WHEN_OFF)
+static void gpsUartRelease() {
+  // An idle-high TX pin back-feeds an unpowered module through its RX pin.
+#if defined(NRF52_PLATFORM)
+  // Adafruit Uart::end() waits forever for EVENTS_TXSTOPPED. The nRF UARTE
+  // generates that only after a transmission has been started, and GPS
+  // bring-up never transmits. Setup reaches this just after BLE advertising
+  // starts, so the wait wedges the node and the first connection hangs.
+  // A second stop (policy apply) must not call end() again: the UART is
+  // already disabled, and that wait would stick the same way.
+  if (Serial1) {
+    Serial1.write((uint8_t)0x00);
+    Serial1.flush();
+    Serial1.end();
+  }
+#else
+  Serial1.end();
+#endif
+  pinMode(PIN_GPS_TX, INPUT);
+  pinMode(PIN_GPS_RX, INPUT);
+}
+#endif
+
+void EnvironmentSensorManager::initBasicGPS() {
+#if defined(GPS_RELEASE_UART_WHEN_OFF) || defined(GPS_EN_HIGH_DRIVE)
+  gpsUartBegin();
+#else
   Serial1.setPins(PIN_GPS_TX, PIN_GPS_RX);
 
   #ifdef GPS_BAUD_RATE
@@ -753,6 +790,7 @@ void EnvironmentSensorManager::initBasicGPS() {
   #else
   Serial1.begin(9600);
   #endif
+#endif
 
   // Try to detect if GPS is physically connected to determine if we should expose the setting
   _location->begin();
@@ -781,8 +819,7 @@ void EnvironmentSensorManager::initBasicGPS() {
   } else {
     MESH_DEBUG_PRINTLN("No GPS detected");
   }
-  _location->stop();
-  gps_active = false; //Set GPS visibility off until setting is changed
+  stop_gps();
 }
 
 // gps code for rak might be moved to MicroNMEALoactionProvider
@@ -882,6 +919,12 @@ void EnvironmentSensorManager::start_gps() {
     return;
   #endif
 
+#if defined(GPS_EN_HIGH_DRIVE)
+  pinMode(PIN_GPS_EN, OUTPUT_H0H1);
+#endif
+#if defined(GPS_RELEASE_UART_WHEN_OFF)
+  gpsUartBegin();
+#endif
   _location->begin();
   _location->reset();
 
@@ -899,6 +942,9 @@ void EnvironmentSensorManager::stop_gps() {
   #endif
 
   _location->stop();
+#if defined(GPS_RELEASE_UART_WHEN_OFF)
+  gpsUartRelease();
+#endif
 
   #ifndef PIN_GPS_EN
   MESH_DEBUG_PRINTLN("Stop GPS is N/A on this board. Actual GPS state unchanged");

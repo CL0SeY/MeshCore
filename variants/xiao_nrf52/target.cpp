@@ -2,9 +2,15 @@
 #include "target.h"
 #include <helpers/ArduinoHelpers.h>
 
+#if ENV_INCLUDE_GPS
+#include <helpers/sensors/MicroNMEALocationProvider.h>
+#endif
+
 #ifdef DISPLAY_CLASS
   DISPLAY_CLASS display;
+  #ifdef PIN_USER_BTN
   MomentaryButton user_btn(PIN_USER_BTN, 1000, true, true);
+  #endif
 #endif
 
 XiaoNrf52Board board;
@@ -16,7 +22,12 @@ WRAPPER_CLASS radio_driver(radio, board);
 VolatileRTCClock fallback_clock;
 AutoDiscoverRTCClock rtc_clock(fallback_clock);
 
+#if ENV_INCLUDE_GPS
+MicroNMEALocationProvider nmea(Serial1, &rtc_clock);
+EnvironmentSensorManager sensors(nmea);
+#else
 EnvironmentSensorManager sensors;
+#endif
 
 bool radio_init() {
   rtc_clock.begin(Wire);
