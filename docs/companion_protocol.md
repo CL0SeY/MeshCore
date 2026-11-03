@@ -206,7 +206,7 @@ Byte 1: 0x03
 **Command Format**:
 ```
 Byte 0: 0x1F
-Byte 1: Channel Index (0-7)
+Byte 1: Channel Index (0 .. max_channels-1)
 ```
 
 **Example** (get channel 1):
@@ -225,7 +225,7 @@ Byte 1: Channel Index (0-7)
 **Command Format**:
 ```
 Byte 0: 0x20
-Byte 1: Channel Index (0-7)
+Byte 1: Channel Index (0 .. max_channels-1)
 Bytes 2-33: Channel Name (32 bytes, UTF-8, null-padded)
 Bytes 34-49: Secret (16 bytes)
 ```
@@ -233,8 +233,12 @@ Bytes 34-49: Secret (16 bytes)
 **Total Length**: 50 bytes
 
 **Channel Index**:
-- Index 0: Reserved for public channels (no secret)
-- Indices 1-7: Available for private channels
+- Valid range is `0` to `max_channels - 1`. Read `max_channels` from byte 3 of
+  the `PACKET_DEVICE_INFO` response; do not assume 8. Builds ship with
+  `MAX_GROUP_CHANNELS` set to 1, 8 or 40 depending on the board.
+- Index 0: pre-populated by the firmware with the built-in "Public" channel.
+  It can be overwritten like any other slot.
+- An out-of-range index is rejected with `PACKET_ERROR` / `ERR_CODE_NOT_FOUND`.
 
 **Channel Name**:
 - UTF-8 encoded
@@ -242,8 +246,18 @@ Bytes 34-49: Secret (16 bytes)
 - Padded with null bytes (0x00) if shorter
 
 **Secret Field** (16 bytes):
-- For **private channels**: 16-byte secret
-- For **public channels**: All zeros (0x00)
+- Always a real 16-byte key; the firmware derives the channel hash from
+  `SHA256(secret)` (`BaseChatMesh.cpp:936-942`). There is no "no secret" form.
+- Do **not** write an all-zero secret. `SHA256` over 16 zero bytes is a fixed,
+  globally identical value, so a zero-secret channel is a well-known channel
+  with an all-zero AES key that any node can read — not a private one. The
+  firmware skips *unnamed* slots when matching inbound group traffic for
+  exactly this reason (`BaseChatMesh.cpp:392-401`), but a slot that has been
+  given a name and a zero secret is not skipped, and will absorb null-key
+  group traffic from any node on the mesh.
+- The built-in public channel uses the well-known key
+  `izOH6cXN6mrJ5e26oRXNcg==` (base64), i.e.
+  `8b3387e9c5cdea6ac9e5edbaa115cd72` in hex.
 
 **Example** (create channel "YourChannelName" at index 1 with secret):
 ```
@@ -265,7 +279,7 @@ Bytes 34-49: Secret (16 bytes)
 ```
 Byte 0: 0x03
 Byte 1: 0x00
-Byte 2: Channel Index (0-7)
+Byte 2: Channel Index (0 .. max_channels-1)
 Bytes 3-6: Timestamp (32-bit little-endian Unix timestamp, seconds)
 Bytes 7+: Message Text (UTF-8, variable length)
 ```
@@ -288,7 +302,7 @@ Bytes 7+: Message Text (UTF-8, variable length)
 **Command Format**:
 ```
 Byte 0:                         0x3E
-Byte 1:                         Channel Index (0-7)
+Byte 1:                         Channel Index (0 .. max_channels-1)
 Byte 2:                         Path Length (0xFF = flood, otherwise actual path length)
 Bytes 3 .. 2+path_len:          Path (omitted when path_len == 0xFF)
 Next 2 bytes (little-endian):   Data Type (`data_type`, uint16)
@@ -306,13 +320,23 @@ Remaining bytes:                Binary payload (variable length)
 - Values `0x0001`–`0xFFFE` are available for registered application/community namespaces. See the [Registered data_type values](#registered-data_type-values) table below.
 
 **Limits**:
-- Maximum payload length is `MAX_CHANNEL_DATA_LENGTH = MAX_FRAME_SIZE - 9 = 163` bytes.
-- Larger payloads are rejected with `PACKET_ERROR` (`ERR_CODE_ILLEGAL_ARG`).
+- Maximum payload length is **165** bytes — `MAX_GROUP_DATA_LENGTH =
+  MAX_PACKET_PAYLOAD - CIPHER_BLOCK_SIZE - 3` (`src/MeshCore.h:21`). This is the
+  radio-side limit and the one clients should enforce.
+- Two different bounds are checked, and they do not agree. The host-frame check
+  uses the larger `MAX_CHANNEL_DATA_LENGTH = MAX_FRAME_SIZE - 9 = 167`
+  (`companion_radio/MyMesh.cpp:1265`); the radio-side check uses 165
+  (`BaseChatMesh.cpp:544`).
+- Payloads **above 167** are rejected with `ERR_CODE_ILLEGAL_ARG` (6).
+- Payloads of **166 or 167** pass the frame check, then fail the radio-side
+  check and return `ERR_CODE_TABLE_FULL` (3). Despite that code's usual
+  meaning, such a send can never succeed — do not retry it. Keep payloads at
+  165 bytes or fewer and this case cannot arise.
 
 **Response**: `PACKET_OK` (0x00) on success, or `PACKET_ERROR` (0x01) with one of:
 - `ERR_CODE_NOT_FOUND` (2) — unknown `channel_idx`
-- `ERR_CODE_ILLEGAL_ARG` (6) — invalid `path_len`, reserved `data_type` (`0x0000`), or payload larger than `MAX_CHANNEL_DATA_LENGTH`
-- `ERR_CODE_TABLE_FULL` (3) — outbound send queue is full; retry later
+- `ERR_CODE_ILLEGAL_ARG` (6) — invalid `path_len`, reserved `data_type` (`0x0000`), or payload larger than `MAX_CHANNEL_DATA_LENGTH` (167)
+- `ERR_CODE_TABLE_FULL` (3) — outbound send queue is full (retry later), **or** a payload of 166-167 bytes that exceeds the radio-side limit (permanent; see Limits above)
 
 **Inbound datagrams** are delivered to the host via `RESP_CODE_CHANNEL_DATA_RECV` (0x1B); see [Receive Channel Data Datagram](#receive-channel-data-datagram).
 
@@ -341,7 +365,7 @@ Inbound group datagrams (radio-level `PAYLOAD_TYPE_GRP_DATA`, 0x06) are forwarde
 Byte 0:                 0x1B (packet type)
 Byte 1:                 SNR (signed int8, scaled ×4 — divide by 4.0 to recover dB)
 Bytes 2-3:              Reserved (clients MUST ignore)
-Byte 4:                 Channel Index (0-7)
+Byte 4:                 Channel Index (0 .. max_channels-1)
 Byte 5:                 Path Length (actual path length when flooded, otherwise 0xFF for direct)
 Bytes 6-7:              Data Type (uint16 little-endian)
 Byte 8:                 Data Length
@@ -550,7 +574,7 @@ def parse_contact_message(data):
 **Standard Format** (`PACKET_CHANNEL_MSG_RECV`, 0x08):
 ```
 Byte 0: 0x08 (packet type)
-Byte 1: Channel Index (0-7)
+Byte 1: Channel Index (0 .. max_channels-1)
 Byte 2: Path Length
 Byte 3: Text Type
 Bytes 4-7: Timestamp (32-bit little-endian)
@@ -562,7 +586,7 @@ Bytes 8+: Message Text (UTF-8)
 Byte 0: 0x11 (packet type)
 Byte 1: SNR (signed byte, multiplied by 4)
 Bytes 2-3: Reserved
-Byte 4: Channel Index (0-7)
+Byte 4: Channel Index (0 .. max_channels-1)
 Byte 5: Path Length
 Byte 6: Text Type
 Bytes 7-10: Timestamp (32-bit little-endian)
@@ -642,6 +666,62 @@ Byte values are authoritative; names are aliases. When reading firmware source, 
 | 0x82  | PACKET_ACK                 | Acknowledgment                |
 | 0x83  | PACKET_MESSAGES_WAITING    | Messages waiting notification |
 | 0x88  | PACKET_LOG_DATA            | RF log data (can be ignored)  |
+| 0x8B  | PACKET_TELEMETRY_RESPONSE  | Self or contact telemetry push |
+
+### Telemetry Payload (CayenneLPP)
+
+The telemetry response (`PACKET_TELEMETRY_RESPONSE`, 0x8B) carries a
+CayenneLPP-encoded payload describing the node's own state. The same LPP
+layout is used by contact-request replies (0x03) and by the self-telemetry
+push (CMD_SEND_TELEMETRY_REQ).  Multi-byte LPP values are **big-endian**;
+the protocol's own framing is little-endian.
+
+Channel 1 (`TELEM_CHANNEL_SELF`) entries in fixed order, as added by the
+firmware's `querySensors` path:
+
+| Type     | ID   | Data size | Description                               |
+|----------|------|-----------|-------------------------------------------|
+| Voltage  | 0x74 | 2 B       | Battery voltage × 100                     |
+| GPS      | 0x88 | 9 B       | lat (3 B, ×10000°), lon, alt              |
+| UnixTime | 0x85 | 4 B       | Provider fix time, seconds since epoch     |
+| GenSensor| 0x64 | 4 B       | `sats × 10⁶ + HHMMSS` (UTC), big-endian uint32 |
+
+The remaining channels (2+) hold per-board environment sensor entries
+(temperature, humidity, pressure, etc.) in whatever order the board's
+active sensors were initialized.
+
+**0x88 semantics.** The position row carries the node's own fix — the live row
+while `gps_active`, otherwise the **last-known** position from the node's fix
+memory (cached on position validity, not on the clock). The 7 MicroNMEA
+variants emit a row whenever location permission is granted — their live row
+ungated and, when off, the remembered one — so a variant node that never fixed
+can send a `(0,0)` position: decoder caveat, not a fix age. May carry a
+`CMD_SET_ADVERT_LATLON` override for up to one GPS update interval after the
+override is set — during that window 0x85 (if present) timestamps the live
+provider fix, not necessarily the override coordinates.
+
+**0x85 semantics.** The unix-time stamp is the node's last-known fix time —
+live while the provider reports a valid fix with a plausible clock (synced from
+NMEA when the fix has held for >2 s, or from the u-blox epoch), otherwise the
+remembered fix time. Emitted whenever the remembered or live fix has a plausible
+clock (≥ 2020-01-01), **including while the GPS is asleep or searching** — the
+stamp's age is the liveness signal, so judge by it, never by its presence. An
+absent 0x85 means the node never held a fix, the clock never locked, or the
+firmware predates this feature.
+
+**0x64 semantics.** One packed value carrying both facts: satellite count in
+the high digits, fix wall clock (UTC) in the low six — e.g. `12170330` = 12
+sats at 17:03:30. Decode `sats = value / 1000000`, `clock = value % 1000000`;
+the clock is 0..235959 so it never carries into the count, and a clock of 0
+means either 00:00:00 or no plausible fix. Encoded as a big-endian **uint32**
+even though the call site passes a `float` to `addGenericSensor` — the library
+writes the raw integer bytes (multiplier 1), so decoders must read uint32, not
+float bits. A positive count beside an aged 0x85 means **last-known**, not
+currently tracking — judge liveness by the stamp's age. Emitted whenever GPS is
+active, and also while asleep or searching when a fix was ever remembered;
+absent on GPS-less sleep with no remembered fix or on older firmware. One entry
+rather than two because UIs that key LPP by `(channel, type)` collapse
+duplicates. Full encoding and board-difference notes: `docs/m2-gps-fix-telemetry.md`.
 
 ### Parsing Responses
 

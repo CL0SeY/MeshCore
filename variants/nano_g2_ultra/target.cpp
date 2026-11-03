@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <helpers/ArduinoHelpers.h>
 #include <helpers/sensors/MicroNMEALocationProvider.h>
+#include <helpers/sensors/GpsTelemetry.h>
 
 NanoG2Ultra board;
 
@@ -68,6 +69,7 @@ bool NanoG2UltraSensorManager::begin() {
 bool NanoG2UltraSensorManager::querySensors(uint8_t requester_permissions, CayenneLPP &telemetry) {
   if (requester_permissions & TELEM_PERM_LOCATION) { // does requester have permission?
     telemetry.addGPS(TELEM_CHANNEL_SELF, node_lat, node_lon, node_altitude);
+    addGpsFixTelemetry(telemetry, _location, gps_active);
   }
   return true;
 }

@@ -1,6 +1,9 @@
 #include "MyMesh.h"
 
 #include <Arduino.h> // needed for PlatformIO
+#ifdef ENABLE_WIFI_INTERFACE
+#include <WiFi.h>
+#endif
 #include <Mesh.h>
 
 #define CMD_APP_START                 1
@@ -62,6 +65,7 @@
 #define CMD_SET_DEFAULT_FLOOD_SCOPE   63
 #define CMD_GET_DEFAULT_FLOOD_SCOPE   64
 #define CMD_SEND_RAW_PACKET           65
+#define CMD_RUN_CLI_COMMAND           66  // v14+
 
 // Stats sub-types for CMD_GET_STATS
 #define STATS_TYPE_CORE               0
@@ -97,6 +101,7 @@
 #define RESP_ALLOWED_REPEAT_FREQ      26
 #define RESP_CODE_CHANNEL_DATA_RECV   27
 #define RESP_CODE_DEFAULT_FLOOD_SCOPE 28
+#define RESP_CODE_CLI_REPLY           29  // v14+, a reply to CMD_RUN_CLI_COMMAND
 
 #define MAX_CHANNEL_DATA_LENGTH       (MAX_FRAME_SIZE - 9)
 
@@ -259,10 +264,10 @@ float MyMesh::getAirtimeBudgetFactor() const {
 }
 
 int MyMesh::getInterferenceThreshold() const {
-  return 0; // disabled for now, until currentRSSI() problem is resolved
+  return _prefs.interference_threshold;
 }
 bool MyMesh::getCADEnabled() const {
-  return false; // hardware CAD before TX (disabled by default, until configurable)
+  return _prefs.cad_enabled;
 }
 
 int MyMesh::calcRxDelay(float score, uint32_t air_time) const {
@@ -271,11 +276,11 @@ int MyMesh::calcRxDelay(float score, uint32_t air_time) const {
 }
 
 uint32_t MyMesh::getRetransmitDelay(const mesh::Packet *packet) {
-  uint32_t t = (_radio->getEstAirtimeFor(packet->getPathByteLen() + packet->payload_len + 2) * 0.5f);
+  uint32_t t = (_radio->getEstAirtimeFor(packet->getPathByteLen() + packet->payload_len + 2) * _prefs.tx_delay_factor);
   return getRNG()->nextInt(0, 5*t + 1);
 }
 uint32_t MyMesh::getDirectRetransmitDelay(const mesh::Packet *packet) {
-  uint32_t t = (_radio->getEstAirtimeFor(packet->getPathByteLen() + packet->payload_len + 2) * 0.2f);
+  uint32_t t = (_radio->getEstAirtimeFor(packet->getPathByteLen() + packet->payload_len + 2) * _prefs.direct_tx_delay_factor);
   return getRNG()->nextInt(0, 5*t + 1);
 }
 
@@ -359,10 +364,6 @@ void MyMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path
       memcpy(&out_frame[1], contact.id.pub_key, PUB_KEY_SIZE);
       _serial->writeFrame(out_frame, 1 + PUB_KEY_SIZE);
     }
-  } else {
-#ifdef DISPLAY_CLASS
-    if (_ui) _ui->notify(UIEventType::newContactMessage);
-#endif
   }
 
   // add inbound-path to mem cache
@@ -385,6 +386,8 @@ void MyMesh::onDiscoveredContact(ContactInfo &contact, bool is_new, uint8_t path
     p->recv_timestamp = getRTCClock()->getCurrentTime();
     p->path_len = mesh::Packet::copyPath(p->path, path, path_len);
   }
+
+  if (_listener) _listener->onDiscoveredContact(contact, is_new, path_len, path);
 
   if (!is_new) dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY); // only schedule lazy write for contacts that are in contacts[]
 }
@@ -412,6 +415,11 @@ void MyMesh::onContactPathUpdated(const ContactInfo &contact) {
 }
 
 ContactInfo*  MyMesh::processAck(const uint8_t *data) {
+  if (_listener) {
+    uint32_t ack_crc;
+    memcpy(&ack_crc, data, 4);
+    _listener->onACKRecv(ack_crc);
+  }
   // see if matches any in a table
   for (int i = 0; i < EXPECTED_ACK_TABLE_SIZE; i++) {
     if (memcmp(data, &expected_ack_table[i].ack, 4) == 0) { // got an ACK from recipient
@@ -464,16 +472,10 @@ void MyMesh::queueMessage(const ContactInfo &from, uint8_t txt_type, mesh::Packe
     _serial->writeFrame(frame, 1);
   }
 
-#ifdef DISPLAY_CLASS
-  // we only want to show text messages on display, not cli data
-  bool should_display = txt_type == TXT_TYPE_PLAIN || txt_type == TXT_TYPE_SIGNED_PLAIN;
-  if (should_display && _ui) {
-    _ui->newMsg(path_len, from.name, text, offline_queue_len);
-    if (!_serial->isConnected()) {
-      _ui->notify(UIEventType::contactMessage);
-    }
+  if (_listener) {
+    _listener->onMessageRecv(pkt, from, txt_type, sender_timestamp, text);
+    _listener->onQueueSizeChanged(offline_queue_len);
   }
-#endif
 }
 
 bool MyMesh::filterRecvFloodPacket(mesh::Packet* packet) {
@@ -524,23 +526,163 @@ void MyMesh::sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pk
 
 void MyMesh::onMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp,
                            const char *text) {
+  if (handleGpsTrigger(from, text)) return;
   markConnectionActive(from); // in case this is from a server, and we have a connection
   queueMessage(from, TXT_TYPE_PLAIN, pkt, sender_timestamp, NULL, 0, text);
 }
 
-void MyMesh::onCommandDataRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp,
-                               const char *text) {
+void MyMesh::onCommandDataRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp, const char *text) {
   markConnectionActive(from); // in case this is from a server, and we have a connection
   queueMessage(from, TXT_TYPE_CLI_DATA, pkt, sender_timestamp, NULL, 0, text);
 }
 
+void MyMesh::onCLICommandRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp,
+                               const char *text, char* reply) {
+  markConnectionActive(from); // in case this is from a server, and we have a connection
+  if (from.isRemoteCLIAllowed()) {
+    if (!handleCommand(text, sender_timestamp, reply)) {
+      strcat(reply, "Unknown command");   // reply may have cmd prefix from 'text'
+    }
+  } else {
+    queueMessage(from, TXT_TYPE_CLI_COMMAND, pkt, sender_timestamp, NULL, 0, text);
+  }
+}
+
 void MyMesh::onSignedMessageRecv(const ContactInfo &from, mesh::Packet *pkt, uint32_t sender_timestamp,
                                  const uint8_t *sender_prefix, const char *text) {
+  if (handleGpsTrigger(from, text)) {
+    markConnectionActive(from);
+    dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
+    return;
+  }
   markConnectionActive(from);
   // from.sync_since change needs to be persisted
   dirty_contacts_expiry = futureMillis(LAZY_CONTACTS_WRITE_DELAY);
   queueMessage(from, TXT_TYPE_SIGNED_PLAIN, pkt, sender_timestamp, sender_prefix, 4, text);
 }
+
+#if ENV_INCLUDE_GPS == 1
+static const char* gpsPolicyName(uint16_t policy) {
+  switch (policy) {
+    case GPS_POLICY_OFF: return "off";
+    case GPS_POLICY_ON:  return "on";
+    default:             return "powersave";
+  }
+}
+
+static bool gpsPolicyFromName(const char* name, uint16_t& out) {
+  if (strcmp(name, "off") == 0) { out = GPS_POLICY_OFF; return true; }
+  if (strcmp(name, "on") == 0) { out = GPS_POLICY_ON; return true; }
+  if (strcmp(name, "powersave") == 0) { out = GPS_POLICY_POWERSAVE; return true; }
+  return false;
+}
+#endif
+
+bool MyMesh::handleGpsTrigger(const ContactInfo &from, const char *text) {
+  if (!text) return false;
+  while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') text++;
+  bool isOff = strcasecmp(text, "!gps off") == 0;
+  bool isOn = strcasecmp(text, "!gps on") == 0;
+  int minutes = 0;
+  if (!isOff && !isOn) {
+    if (strncasecmp(text, "!gps", 4) != 0) return false;
+    const char *p = text + 4;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '\0') return false;
+    char *end;
+    long v = strtol(p, &end, 10);
+    while (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n') end++;
+    if (*end != '\0' || v < 1 || v > 1440) return false;
+    minutes = (int)v;
+  }
+  if ((from.flags & 0x01) == 0) {
+    MESH_DEBUG_PRINTLN("gps trigger ignored (not favourite) from=%s text=%s", from.name, text);
+    return true;
+  }
+  uint8_t prefix[7]; memcpy(prefix, from.id.pub_key, 7);
+  if (isOff) {
+    for (int i = 0; i < MAX_GPS_LEASES; i++) if (gpsLeases[i].used && memcmp(gpsLeases[i].prefix, prefix, 7)==0) {
+      gpsLeases[i].used = false;
+      MESH_DEBUG_PRINTLN("gps off for %s", from.name);
+    }
+    reconcileGpsFromLeases();
+    return true;
+  } else if (_prefs.gps_policy == GPS_POLICY_OFF) {
+    MESH_DEBUG_PRINTLN("gps lease refused (policy off) for %s", from.name);
+    return true;   // consumed, no lease, no power write — same shape as before
+  } else {
+    // !gps on arms a poll-renewed lease (expires 5 min after the last LOC
+    // telemetry poll from this requester); !gps N keeps its fixed window.
+    // Slot 0 is the LOCAL lease (the watch's own polls) — remote triggers
+    // never take or evict it.
+    bool renewable = isOn;
+    uint32_t windowMs = renewable ? GPS_POLL_RENEW_MS : (uint32_t)minutes * 60000UL;
+    uint32_t endsAt = millis() + windowMs;
+    int slot = -1;
+    for (int i = 0; i < MAX_GPS_LEASES; i++) if (gpsLeases[i].used && memcmp(gpsLeases[i].prefix, prefix, 7)==0) { slot = i; break; }
+    if (slot == -1) for (int i = LOCAL_GPS_LEASE_SLOT + 1; i < MAX_GPS_LEASES; i++) if (!gpsLeases[i].used) { slot = i; break; }
+    if (slot == -1) slot = LOCAL_GPS_LEASE_SLOT + 1;
+    memcpy(gpsLeases[slot].prefix, prefix, 7);
+    gpsLeases[slot].endsAt = endsAt;
+    gpsLeases[slot].renewable = renewable;
+    gpsLeases[slot].used = true;
+    strncpy(gpsLeases[slot].name, from.name, sizeof(gpsLeases[slot].name)-1);
+    sensors.setSettingValue("gps", "1");
+    // Cadence is owned by the friend's watch: a remote !gps N must not
+    // overwrite whatever the friend's setCustomVar("gps_interval", ...)
+    // already established. The lease + gps:1 are the only side effects.
+    if (renewable) { MESH_DEBUG_PRINTLN("gps on (poll-renewed) for %s", from.name); }
+    else { MESH_DEBUG_PRINTLN("gps on for %s %d min", from.name, minutes); }
+    return true;
+  }
+}
+
+void MyMesh::reconcileGpsFromLeases() {
+  bool any = false; for (int i=0;i<MAX_GPS_LEASES;i++) if (gpsLeases[i].used) { any = true; break; }
+  if (_prefs.gps_policy == GPS_POLICY_ON) {
+    if (!any) MESH_DEBUG_PRINTLN("gps stays on (policy on, no leases)");
+    return;   // Always on: the wearer's intent outlives the last lease
+  }
+  if (_prefs.gps_policy == GPS_POLICY_OFF) {
+    sensors.setSettingValue("gps", "0");   // Always off: leases cannot hold power
+    MESH_DEBUG_PRINTLN("gps off (policy off)");
+  } else if (!any) {
+    sensors.setSettingValue("gps", "0");
+    MESH_DEBUG_PRINTLN("gps off (no leases)");
+  }
+}
+
+void MyMesh::updateGpsLeases() {
+  bool expired = false; uint32_t now = millis();
+  for (int i=0;i<MAX_GPS_LEASES;i++) if (gpsLeases[i].used && (int32_t)(now - gpsLeases[i].endsAt) >= 0) {
+    MESH_DEBUG_PRINTLN("gps lease expired for %s", gpsLeases[i].name);
+    gpsLeases[i].used = false; expired = true;
+  }
+  if (expired) reconcileGpsFromLeases();
+}
+
+// The watch's own self-telemetry polls renew the LOCAL lease (slot 0) the
+// same way a remote LOC poll renews a remote lease: GPS stays warm while the
+// watch keeps asking and sleeps GPS_POLL_RENEW_MS after the last poll, instead
+// of the watch cutting power with an immediate gps:0. Arms the lease on first
+// use so no explicit opt-in is needed over BLE.
+void MyMesh::renewLocalGpsLease() {
+  if (_prefs.gps_policy == GPS_POLICY_OFF) {
+    MESH_DEBUG_PRINTLN("gps local lease refused (policy off)");
+    return;
+  }
+  GpsLease &slot = gpsLeases[LOCAL_GPS_LEASE_SLOT];
+  if (!slot.used) {
+    memcpy(slot.prefix, self_id.pub_key, 7);
+    slot.renewable = true;
+    slot.used = true;
+    strncpy(slot.name, "local", sizeof(slot.name)-1);
+    sensors.setSettingValue("gps", "1");
+    MESH_DEBUG_PRINTLN("gps local lease armed");
+  }
+  slot.endsAt = millis() + GPS_POLL_RENEW_MS;
+}
+
 
 void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt, uint32_t timestamp,
                                   const char *text) {
@@ -573,20 +715,16 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
     uint8_t frame[1];
     frame[0] = PUSH_CODE_MSG_WAITING; // send push 'tickle'
     _serial->writeFrame(frame, 1);
-  } else {
-#ifdef DISPLAY_CLASS
-    if (_ui) _ui->notify(UIEventType::channelMessage);
-#endif
   }
-#ifdef DISPLAY_CLASS
-  // Get the channel name from the channel index
-  const char *channel_name = "Unknown";
-  ChannelDetails channel_details;
-  if (getChannel(channel_idx, channel_details)) {
-    channel_name = channel_details.name;
+  if (_listener) {
+    // Get the channel name from the channel index
+    ChannelDetails channel_details;
+    if (!getChannel(channel_idx, channel_details)) {
+      strcpy(channel_details.name, "Unknown");
+    }
+    _listener->onChannelMessageRecv(pkt, channel_details, text);
+    _listener->onQueueSizeChanged(offline_queue_len);
   }
-  if (_ui) _ui->newMsg(path_len, channel_name, text, offline_queue_len);
-#endif
 }
 
 void MyMesh::onChannelDataRecv(const mesh::GroupChannel &channel, mesh::Packet *pkt, uint16_t data_type,
@@ -622,6 +760,9 @@ void MyMesh::onChannelDataRecv(const mesh::GroupChannel &channel, mesh::Packet *
     frame[0] = PUSH_CODE_MSG_WAITING; // send push 'tickle'
     _serial->writeFrame(frame, 1);
   }
+  if (_listener) {
+    _listener->onChannelDataRecv(pkt, channel, data_type, data, data_len);
+  }
 }
 
 uint8_t MyMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_timestamp, const uint8_t *data,
@@ -651,6 +792,51 @@ uint8_t MyMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_tim
     uint8_t perm_mask = ~(data[1]);    // NEW: first reserved byte (of 4), is now inverse mask to apply to permissions
     permissions &= perm_mask;
 
+    // Favourited (starred) contacts always get GPS — must survive the request's inverse mask
+    if (contact.flags & 0x01) {
+      permissions |= (TELEM_PERM_BASE | TELEM_PERM_LOCATION);
+    }
+
+    // Poll-renewed GPS lease: a renewable lease (!gps on, or auto-armed
+    // below) is refreshed by every LOC telemetry poll from that requester,
+    // so the friend's GPS stays on while the finder's watch keeps polling
+    // and sleeps 5 min after the last poll. Fixed !gps N leases keep their
+    // explicit window.
+    if (permissions & TELEM_PERM_LOCATION) {
+      if (_prefs.gps_policy == GPS_POLICY_OFF) {
+        // Always off: a poll cannot power the receiver, so no lease and no
+        // gps:1 — the reply carries whatever the receiver already has.
+        MESH_DEBUG_PRINTLN("gps lease refused (policy off) for %s", contact.name);
+      } else {
+        uint8_t rprefix[7]; memcpy(rprefix, contact.id.pub_key, 7);
+        int slot = -1;
+        for (int i = LOCAL_GPS_LEASE_SLOT + 1; i < MAX_GPS_LEASES; i++) {
+          if (gpsLeases[i].used && memcmp(gpsLeases[i].prefix, rprefix, 7)==0) { slot = i; break; }
+        }
+        if (slot != -1 && gpsLeases[slot].renewable) {
+          gpsLeases[slot].endsAt = millis() + GPS_POLL_RENEW_MS;
+        } else if (slot == -1) {
+          // No lease: a permissioned LOC poll is an explicit request for live
+          // position, so arm a renewable lease rather than answering from a
+          // sleeping GPS. Same window as !gps on; !gps off still clears it
+          // (the next poll re-arms, which is the requester's stated intent).
+          // Slot 0 is the LOCAL lease (the watch's own polls) — never take or
+          // evict it for a remote requester.
+          int free = -1;
+          for (int i = LOCAL_GPS_LEASE_SLOT + 1; i < MAX_GPS_LEASES; i++) if (!gpsLeases[i].used) { free = i; break; }
+          if (free == -1) free = LOCAL_GPS_LEASE_SLOT + 1;
+          memcpy(gpsLeases[free].prefix, rprefix, 7);
+          gpsLeases[free].endsAt = millis() + GPS_POLL_RENEW_MS;
+          gpsLeases[free].renewable = true;
+          gpsLeases[free].used = true;
+          strncpy(gpsLeases[free].name, contact.name, sizeof(gpsLeases[free].name)-1);
+          sensors.setSettingValue("gps", "1");
+          MESH_DEBUG_PRINTLN("gps auto-armed (poll) for %s", contact.name);
+        }
+        // Fixed-window (!gps N) leases are left alone: their explicit window wins.
+      }
+    }
+
     if (permissions & TELEM_PERM_BASE) { // only respond if base permission bit is set
       telemetry.reset();
       telemetry.addVoltage(TELEM_CHANNEL_SELF, (float)board.getBattMilliVolts() / 1000.0f);
@@ -669,6 +855,8 @@ uint8_t MyMesh::onContactRequest(const ContactInfo &contact, uint32_t sender_tim
       memcpy(&reply[4], telemetry.getBuffer(), tlen);
       return 4 + tlen;
     }
+  } else if (_listener) {
+    return _listener->onUnhandledRequest(contact, sender_timestamp, data, len, reply);
   }
   return 0; // unknown
 }
@@ -744,6 +932,21 @@ void MyMesh::onContactResponse(const ContactInfo &contact, const uint8_t *data, 
     memcpy(&out_frame[i], &data[4], len - 4);
     i += (len - 4);
     _serial->writeFrame(out_frame, i);
+  } else {
+    bool handled;
+    if (_listener && len > 4) {
+      handled = _listener->onUnhandledResponse(contact, tag, &data[4], len - 4);
+    } else {
+      handled = false;
+    }
+    if (!handled) {   // let the app know about unknown/unhandled responses (eg. push telemetry packets)
+      int i = 0;
+      out_frame[i++] = PUSH_CODE_BINARY_RESPONSE;
+      out_frame[i++] = 0; // reserved
+      memcpy(&out_frame[i], data, len);
+      i += len;
+      _serial->writeFrame(out_frame, i);
+    }
   }
 }
 
@@ -796,6 +999,8 @@ void MyMesh::onControlDataRecv(mesh::Packet *packet) {
   } else {
     MESH_DEBUG_PRINTLN("onControlDataRecv(), data received while app offline");
   }
+
+  if (_listener) _listener->onControlDataRecv(packet);
 }
 
 void MyMesh::onRawDataRecv(mesh::Packet *packet) {
@@ -815,6 +1020,9 @@ void MyMesh::onRawDataRecv(mesh::Packet *packet) {
     _serial->writeFrame(out_frame, i);
   } else {
     MESH_DEBUG_PRINTLN("onRawDataRecv(), data received while app offline");
+  }
+  if (_listener) {
+    _listener->onRawDataRecv(packet);
   }
 }
 
@@ -846,6 +1054,9 @@ void MyMesh::onTraceRecv(mesh::Packet *packet, uint32_t tag, uint32_t auth_code,
   } else {
     MESH_DEBUG_PRINTLN("onTraceRecv(), data received while app offline");
   }
+  if (_listener) {
+    _listener->onTraceRecv(packet, tag, auth_code, flags, path_snrs, path_hashes, path_len);
+  }
 }
 
 uint32_t MyMesh::calcFloodTimeoutMillisFor(uint32_t pkt_airtime_millis) const {
@@ -860,11 +1071,12 @@ uint32_t MyMesh::calcDirectTimeoutMillisFor(uint32_t pkt_airtime_millis, uint8_t
 
 void MyMesh::onSendTimeout() {}
 
-MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMeshTables &tables, DataStore& store, AbstractUITask* ui)
+MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMeshTables &tables, DataStore& store)
     : BaseChatMesh(radio, *new ArduinoMillis(), rng, rtc, *new StaticPoolPacketManager(16), tables),
-      _serial(NULL), telemetry(MAX_PACKET_PAYLOAD - 4), _store(&store), _ui(ui), _iter(0) {
+      _serial(NULL), telemetry(MAX_PACKET_PAYLOAD - 4), _store(&store), _listener(NULL), _iter(0) {
   _iter_started = false;
   _cli_rescue = false;
+  cli_command[0] = 0;
   offline_queue_len = 0;
   app_target_ver = 0;
   clearPendingReqs();
@@ -877,6 +1089,8 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
 
   // defaults
   _prefs.airtime_factor = 1.0;
+  _prefs.tx_delay_factor = 0.5f;
+  _prefs.direct_tx_delay_factor = 0.2f;
   strcpy(_prefs.node_name, "NONAME");
   _prefs.freq = LORA_FREQ;
   _prefs.sf = LORA_SF;
@@ -886,7 +1100,11 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
   _prefs.gps_enabled = 0;       // GPS disabled by default
   _prefs.gps_interval = 0;      // No automatic GPS updates by default
   _prefs.radio_fem_rxgain = 1;
+#ifdef RADIO_FEM_TXGAIN
+  _prefs.radio_fem_txgain = RADIO_FEM_TXGAIN;   // board-specific default for PA
+#else
   _prefs.radio_fem_txgain = 0;
+#endif
   //_prefs.rx_delay_base = 10.0f;  enable once new algo fixed
   _prefs.setRepeatEn(false);
 #if defined(USE_SX1262) || defined(USE_SX1268)
@@ -898,7 +1116,7 @@ MyMesh::MyMesh(mesh::Radio &radio, mesh::RNG &rng, mesh::RTCClock &rtc, SimpleMe
 #endif
 }
 
-void MyMesh::begin(bool has_display) {
+void MyMesh::begin() {
   BaseChatMesh::begin();
 
   if (!_store->loadMainIdentity(self_id)) {
@@ -939,6 +1157,8 @@ void MyMesh::begin(bool has_display) {
 
   // sanitise bad pref values
   _prefs.rx_delay_base = constrain(_prefs.rx_delay_base, 0, 20.0f);
+  _prefs.tx_delay_factor = constrain(_prefs.tx_delay_factor, 0, 2.0f);
+  _prefs.direct_tx_delay_factor = constrain(_prefs.direct_tx_delay_factor, 0, 2.0f);
   _prefs.airtime_factor = constrain(_prefs.airtime_factor, 0, 9.0f);
   _prefs.freq = constrain(_prefs.freq, 150.0f, 2500.0f);
   _prefs.bw = constrain(_prefs.bw, 7.8f, 500.0f);
@@ -947,37 +1167,22 @@ void MyMesh::begin(bool has_display) {
   _prefs.tx_power_dbm = constrain(_prefs.tx_power_dbm, -9, MAX_LORA_TX_POWER);
   _prefs.gps_enabled = constrain(_prefs.gps_enabled, 0, 1);  // Ensure boolean 0 or 1
   _prefs.gps_interval = constrain(_prefs.gps_interval, 0, 86400);  // Max 24 hours
+  if (_prefs.gps_policy > GPS_POLICY_ON) _prefs.gps_policy = GPS_POLICY_POWERSAVE;  // corrupt value: keep pre-policy behaviour
 
-#ifdef BLE_PIN_CODE // 123456 by default
-  if (_prefs.ble_pin == 0) {
-#ifdef DISPLAY_CLASS
-    if (has_display && BLE_PIN_CODE == 123456) {
-      StdRNG rng;
-      _active_ble_pin = rng.nextInt(100000, 999999); // random pin each session
-    } else {
-      _active_ble_pin = BLE_PIN_CODE; // otherwise static pin
-    }
-#else
-    _active_ble_pin = BLE_PIN_CODE; // otherwise static pin
-#endif
-  } else {
-    _active_ble_pin = _prefs.ble_pin;
-  }
-#else
-  _active_ble_pin = 0;
-#endif
+  _active_ble_pin = _prefs.ble_pin;
 
   resetContacts();
   _store->loadContacts(this);
   bootstrapRTCfromContacts();
-  addChannel("Public", PUBLIC_GROUP_PSK); // pre-configure Andy's public channel
+  addChannel("Public", PUBLIC_GROUP_PSK); // pre-configure public channel
   _store->loadChannels(this);
 
   radio_driver.setParams(_prefs.freq, _prefs.bw, _prefs.sf, _prefs.cr);
   radio_driver.setTxPower(_prefs.tx_power_dbm);
   radio_driver.setRxBoostedGainMode(_prefs.rx_boosted_gain);
-  board.setLoRaFemLnaEnabled(_prefs.radio_fem_rxgain);
-  board.setLoRaFemPaGainEnabled(_prefs.radio_fem_txgain);
+
+  board.attachDynamicPrefs(_prefs.getCustom());
+
   MESH_DEBUG_PRINTLN("RX Boosted Gain Mode: %s",
                      radio_driver.getRxBoostedGainMode() ? "Enabled" : "Disabled");
 }
@@ -990,6 +1195,9 @@ NodePrefs *MyMesh::getNodePrefs() {
 }
 uint32_t MyMesh::getBLEPin() {
   return _active_ble_pin;
+}
+void MyMesh::setBLEPin(uint32_t active_pin) {
+  _active_ble_pin = active_pin;
 }
 
 struct FreqRange {
@@ -1082,6 +1290,20 @@ void MyMesh::handleCmdFrame(size_t len) {
     memcpy(&out_frame[i], _prefs.node_name, tlen);
     i += tlen;
     _serial->writeFrame(out_frame, i);
+  } else if (cmd_frame[0] == CMD_RUN_CLI_COMMAND && len >= 3) { // V14+
+    int i = 1;
+    char *text = (char *)&cmd_frame[i];
+    int tlen = len - i;
+    text[tlen] = 0; // ensure null
+
+    reply_buf[0] = 0;
+    if (!handleCommand(text, 0, reply_buf)) {
+      strcat(reply_buf, "Unknown command");   // reply_buf may have cmd prefix from 'text'
+    }
+    out_frame[0] = RESP_CODE_CLI_REPLY;
+    int rlen = strlen(reply_buf);
+    memcpy(&out_frame[1], reply_buf, rlen);
+    _serial->writeFrame(out_frame, 1 + rlen);
   } else if (cmd_frame[0] == CMD_SEND_TXT_MSG && len >= 14) {
     int i = 1;
     uint8_t txt_type = cmd_frame[i++];
@@ -1092,16 +1314,16 @@ void MyMesh::handleCmdFrame(size_t len) {
     uint8_t *pub_key_prefix = &cmd_frame[i];
     i += 6;
     ContactInfo *recipient = lookupContactByPubKey(pub_key_prefix, 6);
-    if (recipient && (txt_type == TXT_TYPE_PLAIN || txt_type == TXT_TYPE_CLI_DATA)) {
+    if (recipient && (txt_type == TXT_TYPE_PLAIN || txt_type == TXT_TYPE_CLI_DATA || txt_type == TXT_TYPE_CLI_COMMAND)) {
       char *text = (char *)&cmd_frame[i];
       int tlen = len - i;
       uint32_t est_timeout;
       text[tlen] = 0; // ensure null
       int result;
       uint32_t expected_ack;
-      if (txt_type == TXT_TYPE_CLI_DATA) {
+      if (txt_type == TXT_TYPE_CLI_DATA || txt_type == TXT_TYPE_CLI_COMMAND) {
         msg_timestamp = getRTCClock()->getCurrentTimeUnique(); // Use node's RTC instead of app timestamp to avoid tripping replay protection
-        result = sendCommandData(*recipient, msg_timestamp, attempt, text, est_timeout);
+        result = sendCommandData(*recipient, msg_timestamp, attempt, txt_type, text, est_timeout);
         expected_ack = 0; // no Ack expected
       } else {
         result = sendMessage(*recipient, msg_timestamp, attempt, text, expected_ack, est_timeout);
@@ -1180,8 +1402,8 @@ void MyMesh::handleCmdFrame(size_t len) {
       writeErrFrame(ERR_CODE_NOT_FOUND); // bad channel_idx
     } else if (data_type == DATA_TYPE_RESERVED) {
       writeErrFrame(ERR_CODE_ILLEGAL_ARG);
-    } else if (payload_len > MAX_CHANNEL_DATA_LENGTH) {
-      MESH_DEBUG_PRINTLN("CMD_SEND_CHANNEL_DATA payload too long: %d > %d", payload_len, MAX_CHANNEL_DATA_LENGTH);
+    } else if (payload_len > MAX_GROUP_DATA_LENGTH) {
+      MESH_DEBUG_PRINTLN("CMD_SEND_CHANNEL_DATA payload too long: %d > %d", payload_len, MAX_GROUP_DATA_LENGTH);
       writeErrFrame(ERR_CODE_ILLEGAL_ARG);
     } else if (sendGroupData(channel.channel, path, path_len, data_type, payload, payload_len)) {
       writeOKFrame();
@@ -1369,9 +1591,7 @@ void MyMesh::handleCmdFrame(size_t len) {
     int out_len;
     if ((out_len = getFromOfflineQueue(out_frame)) > 0) {
       _serial->writeFrame(out_frame, out_len);
-#ifdef DISPLAY_CLASS
-      if (_ui) _ui->msgRead(offline_queue_len);
-#endif
+      if (_listener) _listener->onQueueSizeChanged(offline_queue_len);
     } else {
       out_frame[0] = RESP_CODE_NO_MORE_MESSAGES;
       _serial->writeFrame(out_frame, 1);
@@ -1511,16 +1731,20 @@ void MyMesh::handleCmdFrame(size_t len) {
 #endif
   } else if (cmd_frame[0] == CMD_SEND_RAW_DATA && len >= 6) {
     int i = 1;
-    int8_t path_len = cmd_frame[i++];
-    if (path_len >= 0 && i + path_len + 4 <= len) { // minimum 4 byte payload
-      uint8_t *path = &cmd_frame[i];
-      i += path_len;
-      auto pkt = createRawData(&cmd_frame[i], len - i);
-      if (pkt) {
-        sendDirect(pkt, path, path_len);
-        writeOKFrame();
+    uint8_t path_len = cmd_frame[i++];
+    if (path_len >= 0 && mesh::Packet::isValidPathLen(path_len)) {
+      uint8_t path[MAX_PATH_SIZE];
+      i += mesh::Packet::writePath(path, &cmd_frame[i], path_len);
+      if (i + 4 > len) {  // min payload 4 bytes
+        writeErrFrame(ERR_CODE_ILLEGAL_ARG);
       } else {
-        writeErrFrame(ERR_CODE_TABLE_FULL);
+        auto pkt = createRawData(&cmd_frame[i], len - i);
+        if (pkt) {
+          sendDirect(pkt, path, path_len);
+          writeOKFrame();
+        } else {
+          writeErrFrame(ERR_CODE_TABLE_FULL);
+        }
       }
     } else {
       writeErrFrame(ERR_CODE_UNSUPPORTED_CMD); // flood, not supported (yet)
@@ -1649,6 +1873,9 @@ void MyMesh::handleCmdFrame(size_t len) {
       writeErrFrame(ERR_CODE_NOT_FOUND); // contact not found
     }
   } else if (cmd_frame[0] == CMD_SEND_TELEMETRY_REQ && len == 4) {  // 'self' telemetry request
+    // The watch asking for its own position renews the LOCAL lease, so GPS
+    // lingers warm between sessions instead of cutting off on gps:0.
+    renewLocalGpsLease();
     telemetry.reset();
     telemetry.addVoltage(TELEM_CHANNEL_SELF, (float)board.getBattMilliVolts() / 1000.0f);
     float temperature = board.getMCUTemperature();
@@ -1665,6 +1892,7 @@ void MyMesh::handleCmdFrame(size_t len) {
     memcpy(&out_frame[i], self_id.pub_key, 6);
     i += 6; // pub_key_prefix
     uint8_t tlen = telemetry.getSize();
+    if (i + tlen > MAX_FRAME_SIZE) tlen = MAX_FRAME_SIZE - i;
     memcpy(&out_frame[i], telemetry.getBuffer(), tlen);
     i += tlen;
     _serial->writeFrame(out_frame, i);
@@ -1814,6 +2042,24 @@ void MyMesh::handleCmdFrame(size_t len) {
       strcpy(dp, sensors.getSettingValue(i));
       dp = strchr(dp, 0);
     }
+    #if ENV_INCLUDE_GPS == 1
+    // gps_policy is MyMesh-owned intent, not a variant setting, so it is
+    // appended rather than enumerated — but only beside a readable `gps` key:
+    // the pair is the companion's Full capability advertisement, so a
+    // policy-only reply (no detected GPS) must not carry it.
+    bool gps_key = false;
+    for (int i = 0; i < sensors.getNumSettings(); i++) {
+      const char *name = sensors.getSettingName(i);
+      if (name != NULL && strcmp(name, "gps") == 0) { gps_key = true; break; }
+    }
+    if (gps_key && dp - (char *)&out_frame[1] < 140) {
+      *dp++ = ',';
+      strcpy(dp, "gps_policy:");
+      dp = strchr(dp, 0);
+      strcpy(dp, gpsPolicyName(_prefs.gps_policy));
+      dp = strchr(dp, 0);
+    }
+    #endif
     _serial->writeFrame(out_frame, dp - (char *)out_frame);
   } else if (cmd_frame[0] == CMD_SET_CUSTOM_VAR && len >= 4) {
     cmd_frame[len] = 0;
@@ -1821,23 +2067,91 @@ void MyMesh::handleCmdFrame(size_t len) {
     char *np = strchr(sp, ':'); // look for separator char
     if (np) {
       *np++ = 0; // modify 'cmd_frame', replace ':' with null
+      #if ENV_INCLUDE_GPS == 1
+      if (strcmp(sp, "gps") == 0) {
+        // Power token. Explicit `gps:1` and `gps:0` always win over the
+        // policy's standing behaviour: `gps:1` powers on even under policy
+        // `off`, `gps:0` powers down now even under policy `on`. The only
+        // down-ask that does not apply is under `powersave` with a live
+        // lease, where the lessee's poll window owns power.
+        if (np[0] == '0') {
+          bool leasesActive = false; for (int i=0;i<MAX_GPS_LEASES;i++) if (gpsLeases[i].used) { leasesActive = true; break; }
+          if (leasesActive && _prefs.gps_policy == GPS_POLICY_POWERSAVE) {
+            MESH_DEBUG_PRINTLN("gps:0 from watch ignored (leases active)");
+            writeOKFrame();
+          } else if (sensors.setSettingValue("gps", "0")) {
+            _prefs.gps_enabled = 0; savePrefs(); writeOKFrame();
+          } else {
+            writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+          }
+        } else if (sensors.setSettingValue("gps", "1")) {
+          _prefs.gps_enabled = 1; savePrefs(); writeOKFrame();
+        } else {
+          writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+        }
+      } else if (strcmp(sp, "gps_policy") == 0) {
+        uint16_t policy;
+        if (gpsPolicyFromName(np, policy)) {
+          _prefs.gps_policy = policy;
+          if (policy == GPS_POLICY_OFF) {
+            // Intent lands as power-down: the paired gps:0 may have been
+            // ignored under the previous policy, and a reconnect sync sends
+            // no power write at all. Every hold dies with it — a lease that
+            // survived off would block a later powersave flip's down-ask.
+            for (int i = 0; i < MAX_GPS_LEASES; i++) gpsLeases[i].used = false;
+            sensors.setSettingValue("gps", "0");
+            _prefs.gps_enabled = 0;
+            MESH_DEBUG_PRINTLN("gps_policy=off: receiver down");
+          } else if (policy == GPS_POLICY_ON) {
+            // Mirror of off: the policy write itself re-asserts intent as
+            // power, so a reconnect sync with no `gps:1` behind it still
+            // arms the receiver.
+            sensors.setSettingValue("gps", "1");
+            _prefs.gps_enabled = 1;
+            MESH_DEBUG_PRINTLN("gps_policy=on: receiver armed");
+          } else {
+            // powersave: power follows leases, so this write is what ends an
+            // `on` hold (Always on -> When needed) or any explicit power write:
+            // none of them leaves a lease behind, and the sweep only runs when
+            // a lease expires — so without this the receiver stays powered with
+            // nothing able to sleep it. The mirror is cleared with it because
+            // it cannot be trusted as a power indicator (the F4 boot arm and
+            // the sweep both change power without updating it), and leaving it
+            // set lets the powersave boot fallback re-arm the receiver.
+            bool leased = false;
+            for (int i = 0; i < MAX_GPS_LEASES; i++) if (gpsLeases[i].used) { leased = true; break; }
+            if (!leased) {
+              sensors.setSettingValue("gps", "0");   // idempotent: GPIO/stop() on every variant
+              _prefs.gps_enabled = 0;
+              MESH_DEBUG_PRINTLN("gps_policy=powersave: receiver off (no leases)");
+            }
+          }
+          savePrefs();
+          writeOKFrame();
+        } else {
+          writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+        }
+      } else {
+        bool success = sensors.setSettingValue(sp, np);
+        if (success) {
+          if (strcmp(sp, "gps_interval") == 0) {
+            uint32_t interval_seconds = atoi(np);
+            _prefs.gps_interval = constrain(interval_seconds, 0, 86400);
+            savePrefs();
+          }
+          writeOKFrame();
+        } else {
+          writeErrFrame(ERR_CODE_ILLEGAL_ARG);
+        }
+      }
+      #else
       bool success = sensors.setSettingValue(sp, np);
       if (success) {
-        #if ENV_INCLUDE_GPS == 1
-        // Update node preferences for GPS settings
-        if (strcmp(sp, "gps") == 0) {
-          _prefs.gps_enabled = (np[0] == '1') ? 1 : 0;
-          savePrefs();
-        } else if (strcmp(sp, "gps_interval") == 0) {
-          uint32_t interval_seconds = atoi(np);
-          _prefs.gps_interval = constrain(interval_seconds, 0, 86400);
-          savePrefs();
-        }
-        #endif
         writeOKFrame();
       } else {
         writeErrFrame(ERR_CODE_ILLEGAL_ARG);
       }
+      #endif
     } else {
       writeErrFrame(ERR_CODE_ILLEGAL_ARG);
     }
@@ -2027,8 +2341,149 @@ void MyMesh::enterCLIRescue() {
   Serial.println("========= CLI Rescue =========");
 }
 
+bool MyMesh::handleCommand(const char* command, uint32_t sender_timestamp, char* reply) {
+  while (*command == ' ') command++; // skip leading spaces
+
+  if (strlen(command) > 4 && command[2] == '|') { // optional prefix (for companion radio CLI)
+    memcpy(reply, command, 3);                    // reflect the prefix back
+    reply += 3;
+    *reply = 0;
+    command += 3;
+  }
+
+  if (_prefs.getRadioPrefs()->handleCommand(command, sender_timestamp, reply)) {  // is radio CLI command?
+    if (_prefs.getRadioPrefs()->isDirty()) { savePrefs(); }
+    return true;
+  }
+
+  // hook for variant-specific CLI processing
+  if (board.handleCommand(command, sender_timestamp, reply)) {
+    if (_prefs.isDirty()) { savePrefs(); }
+    return true;
+  }
+
+  if (strcmp(command, "reboot") == 0) {
+    board.reboot(); // doesn't return
+    return true;
+  }
+
+  if (strcmp(command, "poweroff") == 0 || strcmp(command, "shutdown") == 0) {
+    board.powerOff(); // doesn't return
+    return true;
+  }
+
+  if (memcmp(command, "set name ", 9) == 0) {
+    if (AdvertDataParser::isValidName(&command[9])) {
+      StrHelper::strncpy(_prefs.node_name, &command[9], sizeof(_prefs.node_name));
+      savePrefs();
+      strcpy(reply, "OK");
+    } else {
+      strcpy(reply, "Error, bad chars");
+    }
+    return true;
+  }
+  if (strcmp(command, "get name") == 0) {
+    sprintf(reply, "> %s", _prefs.node_name);
+    return true;
+  }
+
+  if (memcmp(command, "set pin ", 8) == 0) {
+    _prefs.ble_pin = atoi(&command[8]);
+    savePrefs();
+    sprintf(reply, "> pin is now %06d", _prefs.ble_pin);
+    return true;
+  }
+
+#ifdef ENABLE_WIFI_INTERFACE
+  if (memcmp(command, "set wifi.ssid ", 14) == 0) {
+    StrHelper::strncpy(_prefs.wifi_ssid, &command[14], sizeof(_prefs.wifi_ssid));
+    savePrefs();
+    sprintf(reply, "> wifi.ssid is now %s (set wifi.pwd too, then reboot)", _prefs.wifi_ssid);
+    return true;
+  }
+  if (memcmp(command, "set wifi.pwd ", 13) == 0) {
+    StrHelper::strncpy(_prefs.wifi_pwd, &command[13], sizeof(_prefs.wifi_pwd));
+    savePrefs();
+    strcpy(reply, "> wifi.pwd updated (reboot to apply)");
+    return true;
+  }
+  if (strcmp(command, "get wifi.pwd") == 0) {
+    sprintf(reply, "> %s", _prefs.wifi_pwd);
+    return true;
+  }
+  if (strcmp(command, "set wifi.clear") == 0) {
+    _prefs.wifi_ssid[0] = 0;
+    _prefs.wifi_pwd[0] = 0;
+    savePrefs();
+    strcpy(reply, "> wifi config cleared (reboot to apply)");
+    return true;
+  }
+  if (strcmp(command, "get wifi.ssid") == 0) {
+    sprintf(reply, "> %s", _prefs.getWifiSSID()[0] ? _prefs.getWifiSSID() : "(not set)");
+    return true;
+  }
+  if (memcmp(command, "set wifi.enabled ", 17) == 0) {
+    _prefs.wifi_enabled = atoi(&command[17]) ? 1 : 0;
+    savePrefs();
+    sprintf(reply, "> wifi.enabled is now %d (reboot to apply)", _prefs.wifi_enabled);
+    return true;
+  }
+  if (strcmp(command, "get wifi.enabled") == 0) {
+    sprintf(reply, "> %d", _prefs.wifi_enabled);
+    return true;
+  }
+  if (strcmp(command, "get wifi.status") == 0) {
+    strcpy(reply, WiFi.status() == WL_CONNECTED ? "> connected" : "> disconnected");
+    return true;
+  }
+  if (strcmp(command, "get wifi.ip") == 0) {
+    if (WiFi.status() == WL_CONNECTED) {
+      sprintf(reply, "> %s", WiFi.localIP().toString().c_str());
+    } else {
+      strcpy(reply, "> (not connected)");
+    }
+    return true;
+  }
+#endif
+
+  if (strcmp(command, "board") == 0) {
+    strcpy(reply, board.getManufacturerName());
+    return true;
+  }
+
+  if (strcmp(command, "ver") == 0) {
+    sprintf(reply, "%s (Build: %s)", FIRMWARE_VERSION, FIRMWARE_BUILD_DATE);
+    return true;
+  }
+
+  if (strcmp(command, "get tz.offset") == 0) {
+    sprintf(reply, "> %d", _prefs.tz_offset);
+    return true;
+  }
+  if (memcmp(command, "set tz.offset ", 14) == 0) {
+    int8_t tz = atof(&command[14]);
+    if (tz < -12 || tz > 14) {
+      strcpy(reply, "Error, must be from -12 to +14");
+    } else {
+      _prefs.tz_offset = tz;
+      savePrefs();
+      strcpy(reply, "OK");
+    }
+    return true;
+  }
+
+  return false;  // not handled
+}
+
 void MyMesh::checkCLIRescueCmd() {
   int len = strlen(cli_command);
+  // `cli_command` must stay NUL-terminated within its bounds. If it ever isn't,
+  // strlen() above can return >= sizeof(cli_command) and the loop below would
+  // then index past the buffer, so clamp defensively.
+  if (len >= (int)sizeof(cli_command)) {
+    cli_command[0] = 0;
+    len = 0;
+  }
   while (Serial.available() && len < sizeof(cli_command)-1) {
     char c = Serial.read();
     if (c != '\n') {
@@ -2037,22 +2492,18 @@ void MyMesh::checkCLIRescueCmd() {
     }
     Serial.print(c);  // echo
   }
-  if (len == sizeof(cli_command)-1) {  // command buffer full
-    cli_command[sizeof(cli_command)-1] = '\r';
+  if (len == sizeof(cli_command)-1) {  // buffer full: treat as a completed line
+    cli_command[sizeof(cli_command)-2] = '\r';  // place end-of-line marker inside the buffer
+    cli_command[sizeof(cli_command)-1] = 0;     // keep the buffer NUL-terminated
   }
 
   if (len > 0 && cli_command[len - 1] == '\r') {  // received complete line
     cli_command[len - 1] = 0;  // replace newline with C string null terminator
 
-    if (memcmp(cli_command, "set ", 4) == 0) {
-      const char* config = &cli_command[4];
-      if (memcmp(config, "pin ", 4) == 0) {
-        _prefs.ble_pin = atoi(&config[4]);
-        savePrefs();
-        Serial.printf("  > pin is now %06d\n", _prefs.ble_pin);
-      } else {
-        Serial.printf("  Error: unknown config: %s\n", config);
-      }
+    reply_buf[0] = 0;
+    if (handleCommand(cli_command, 0, reply_buf)) {
+      // command was handled, print reply output
+      Serial.print("  "); Serial.print(reply_buf); Serial.println();
     } else if (strcmp(cli_command, "rebuild") == 0) {
       bool success = _store->formatFileSystem();
       if (success) {
@@ -2229,10 +2680,17 @@ void MyMesh::checkSerialInterface() {
 void MyMesh::loop() {
   BaseChatMesh::loop();
 
+  updateGpsLeases();
+
   if (_cli_rescue) {
     checkCLIRescueCmd();
   } else {
     checkSerialInterface();
+#if defined(ENABLE_WIFI_INTERFACE) && defined(RP2040_PLATFORM) && !defined(ENABLE_USB_INTERFACE)
+    // RP2040 WiFi builds are headless and have no way into the rescue CLI (that needs a
+    // display + long-press), so serve config commands on the otherwise unused USB serial
+    checkCLIRescueCmd();
+#endif
   }
 
   // is there are pending dirty contacts write needed?
@@ -2240,10 +2698,6 @@ void MyMesh::loop() {
     saveContacts();
     dirty_contacts_expiry = 0;
   }
-
-#ifdef DISPLAY_CLASS
-  if (_ui) _ui->setHasConnection(_serial->isConnected());
-#endif
 }
 
 bool MyMesh::advert() {

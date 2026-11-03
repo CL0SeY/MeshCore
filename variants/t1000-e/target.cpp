@@ -2,6 +2,8 @@
 #include "t1000e_sensors.h"
 #include "target.h"
 #include <helpers/sensors/MicroNMEALocationProvider.h>
+#include <helpers/sensors/GpsTelemetry.h>
+#include <helpers/sensors/AirohaSleep.h>
 
 T1000eBoard board;
 
@@ -81,62 +83,35 @@ mesh::LocalIdentity radio_new_identity() {
 
 void T1000SensorManager::start_gps() {
   gps_active = true;
-  //_nmea->begin();
-  // this init sequence should be better 
-  // comes from seeed examples and deals with all gps pins
-  pinMode(GPS_EN, OUTPUT);
   digitalWrite(GPS_EN, HIGH);
   delay(10);
-  pinMode(GPS_VRTC_EN, OUTPUT);
-  digitalWrite(GPS_VRTC_EN, HIGH);
-  delay(10);
-       
-  pinMode(GPS_RESET, OUTPUT);
-  digitalWrite(GPS_RESET, HIGH);
-  delay(10);
-  digitalWrite(GPS_RESET, LOW);
-       
-  pinMode(GPS_SLEEP_INT, OUTPUT);
-  digitalWrite(GPS_SLEEP_INT, HIGH);
-  pinMode(GPS_RTC_INT, OUTPUT);
+  digitalWrite(GPS_RTC_INT, HIGH);
+  delay(5);
   digitalWrite(GPS_RTC_INT, LOW);
-  pinMode(GPS_RESETB, INPUT_PULLUP);
-}
-
-void T1000SensorManager::sleep_gps() {
-  gps_active = false;
-  digitalWrite(GPS_VRTC_EN, HIGH);
-  digitalWrite(GPS_EN, LOW);
-  digitalWrite(GPS_RESET, HIGH);
-  digitalWrite(GPS_SLEEP_INT, HIGH);
-  digitalWrite(GPS_RTC_INT, LOW);
-  pinMode(GPS_RESETB, OUTPUT);
-  digitalWrite(GPS_RESETB, LOW);
-  //_nmea->stop();
 }
 
 void T1000SensorManager::stop_gps() {
   gps_active = false;
-  digitalWrite(GPS_VRTC_EN, LOW);
+  digitalWrite(GPS_VRTC_EN, HIGH);   // keep GPS RTC alive for faster fix on wake
+  digitalWrite(GPS_RTC_INT, LOW);    // make sure this is LOW so we can pulse it to wake
+  airohaEnterSleep(_nmea);           // send command to put the GPS into RTC backup sleep
   digitalWrite(GPS_EN, LOW);
-  digitalWrite(GPS_RESET, HIGH);
-  digitalWrite(GPS_SLEEP_INT, HIGH);
-  digitalWrite(GPS_RTC_INT, LOW);
-  pinMode(GPS_RESETB, OUTPUT);
-  digitalWrite(GPS_RESETB, LOW);
-  //_nmea->stop();
 }
 
 
 bool T1000SensorManager::begin() {
   // init GPS
   Serial1.begin(115200);
+  digitalWrite(GPS_RESET, HIGH);
+  delay(10);
+  digitalWrite(GPS_RESET, LOW);
   return true;
 }
 
 bool T1000SensorManager::querySensors(uint8_t requester_permissions, CayenneLPP& telemetry) {
   if (requester_permissions & TELEM_PERM_LOCATION) {   // does requester have permission?
     telemetry.addGPS(TELEM_CHANNEL_SELF, node_lat, node_lon, node_altitude);
+    addGpsFixTelemetry(telemetry, _nmea, gps_active);
   }
   if (requester_permissions & TELEM_PERM_ENVIRONMENT) {
     // Firmware reports light as a 0-100 % scale, but expose it via Luminosity so app labels it "Luminosity".
@@ -156,9 +131,8 @@ void T1000SensorManager::loop() {
       node_lat = ((double)_nmea->getLatitude())/1000000.;
       node_lon = ((double)_nmea->getLongitude())/1000000.;
       node_altitude = ((double)_nmea->getAltitude()) / 1000.0;
-      //Serial.printf("lat %f lon %f\r\n", _lat, _lon);
     }
-    next_gps_update = millis() + 1000;
+    next_gps_update = millis() + (gps_update_interval_sec * 1000);
   }
 }
 
@@ -176,10 +150,16 @@ const char* T1000SensorManager::getSettingValue(int i) const {
 bool T1000SensorManager::setSettingValue(const char* name, const char* value) {
   if (strcmp(name, "gps") == 0) {
     if (strcmp(value, "0") == 0) {
-      sleep_gps(); // sleep for faster fix !
+      stop_gps();
     } else {
       start_gps();
     }
+    return true;
+  }
+  if (strcmp(name, "gps_interval") == 0) {
+    uint32_t interval_seconds = atoi(value);
+    gps_update_interval_sec = interval_seconds > 0 ? interval_seconds : 1;
+    if (gps_update_interval_sec > 86400) gps_update_interval_sec = 86400;
     return true;
   }
   return false;  // not supported
