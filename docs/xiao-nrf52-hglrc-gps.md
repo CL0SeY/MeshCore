@@ -12,16 +12,20 @@ Artifacts: `MeshCore/.pio/build/Xiao_nrf52_companion_radio_ble/`.
 
 ## Wiring
 
-| Module | XIAO |
+| Module | Connection |
 | --- | --- |
 | TX | D7 (silk **RX**, P1.12). This is the MCU receive pin. |
 | RX | D6 (silk **TX**, P1.11). This is the MCU transmit pin. |
 | GND | GND |
-| VCC | **3V3** pin |
+| VCC | Drain of a P-channel MOSFET |
 
-Leave D0 disconnected. Do not tie module VCC to D0 and 3V3 at the same time. D0 is driven low to turn the GPS off and will fight a hard 3V3 tie.
+MOSFET: source to the XIAO **3V3** pin, drain to module VCC, gate to D0. One 100 kΩ resistor from the gate to 3V3. No series resistor in the gate. D0 low turns the module on. D0 high turns it off.
 
-The module has its own regulator. This lock was taken from the XIAO 3V3 pin. The 5V pin is USB VBUS and is not a 5 V output on battery.
+Use a P-channel logic-level MOSFET with Vgs(th) between −0.5 V and −2.0 V so a 3.3 V gate swing turns it fully on. Do not substitute an N-channel between 3V3 and VCC. Do not also tie module VCC to the XIAO 3V3 pin. Do not tie D0 to 3V3.
+
+Until that MOSFET is fitted, module VCC may stay on the XIAO 3V3 pin with D0 left open. Flashing this firmware in that state does not cut power, because D0 is open. Powersave cuts the rail only after VCC comes only from the drain.
+
+The module has its own regulator. The 5V pin is USB VBUS and is not a 5 V output on battery.
 
 The ceramic patch must face the sky. Face-down, next to a T1000-E that had 18 satellites and a fix, this module sat on 3–4 satellites and never solved a position. Turning the patch up produced the lock.
 
@@ -31,7 +35,7 @@ Flags live only on `[env:Xiao_nrf52_companion_radio_ble]` in `variants/xiao_nrf5
 
 - `ENV_INCLUDE_GPS=1`
 - `PIN_GPS_TX=D7`, `PIN_GPS_RX=D6` (`Uart::setPins` takes RX, then TX, so `PIN_GPS_TX` is the MCU RX pin)
-- `PIN_GPS_EN=D0`, `PIN_GPS_EN_ACTIVE=HIGH`, `GPS_EN_HIGH_DRIVE=1`
+- `PIN_GPS_EN=D0`, `PIN_GPS_EN_ACTIVE=LOW`
 - `GPS_BAUD_RATE=9600`
 - `ENV_SKIP_GPS_DETECT=1`
 - `GPS_RELEASE_UART_WHEN_OFF=1`
@@ -47,15 +51,13 @@ LoRa stays on D1–D5 and D8–D10. SPI is SPIM3, Wire is TWIM0, and the GPS UAR
 
 The app setting is `gps` / `gps_policy`: `off`, `powersave` (default), or `on`. There is no `position.power_pin`.
 
-- `on` holds D0 high.
-- `off` holds D0 low and refuses leases.
-- `powersave` drives D0 high only during a lease or location poll.
+- `on` holds D0 low.
+- `off` holds D0 high and refuses leases.
+- `powersave` drives D0 low only during a lease or location poll.
 
 CLI `gps on` / `gps off` is not policy-aware.
 
-With VCC hard-wired to 3V3, D0 no longer switches the module. The UART still has to be running: `stop_gps()` releases it, and sentences stop. Keep `gps_policy` on, or keep the app connected so the local lease holds `gps` at 1.
-
-D0 high-drive sources about 15 mA and sags under a searching module. It is an enable, not a supply. A permanent install should let D0 switch the 3V3 rail through an active-high load switch. A P-channel MOSFET with its gate tied straight to D0 turns the rail on when D0 is low, which is the opposite of this firmware.
+D0 only drives the MOSFET gate. It does not source the module.
 
 ## How to read the app
 
@@ -73,4 +75,4 @@ The generic sensor (`0x64`) is `satellites × 1000000 + HHMMSS` UTC. The clock d
 
 `gpsUartRelease()` writes one byte and `flush()` before `Serial1.end()` on nRF52, and skips `end()` when `Serial1` is already stopped. Adafruit `Uart::end()` waits forever for `EVENTS_TXSTOPPED` if no TX was ever started, which wedges the node at the first BLE connection.
 
-`initBasicGPS()` opens the UART, powers the enable pin, waits 1 s, forces `gps_detected` (`ENV_SKIP_GPS_DETECT`), then `stop_gps()` so the UART is released until a lease or `gps_policy on` starts it again.
+`initBasicGPS()` opens the UART, powers the enable pin, waits 1 s, forces `gps_detected` (`ENV_SKIP_GPS_DETECT`), then `stop_gps()` so the UART is released until a lease or `gps_policy on` starts it again. With the P-channel fitted, that probe drives D0 low for the 1 s delay (module on) and `stop_gps()` then drives D0 high (module off).

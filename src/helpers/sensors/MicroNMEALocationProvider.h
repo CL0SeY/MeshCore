@@ -59,11 +59,8 @@ public :
             digitalWrite(_pin_reset, GPS_RESET_ACTIVE);
         }
         if (_pin_en != -1) {
-#ifdef GPS_EN_HIGH_DRIVE
-            pinMode(_pin_en, OUTPUT_H0H1);
-#else
+            digitalWrite(_pin_en, !GPS_EN_ACTIVE);
             pinMode(_pin_en, OUTPUT);
-#endif
             digitalWrite(_pin_en, !GPS_EN_ACTIVE);
         }
     }

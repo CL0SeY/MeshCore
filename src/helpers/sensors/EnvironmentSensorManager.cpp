@@ -745,7 +745,7 @@ bool EnvironmentSensorManager::setSettingValue(const char* name, const char* val
 
 #if ENV_INCLUDE_GPS
 
-#if defined(GPS_RELEASE_UART_WHEN_OFF) || defined(GPS_EN_HIGH_DRIVE)
+#if defined(GPS_RELEASE_UART_WHEN_OFF)
 static void gpsUartBegin() {
   Serial1.setPins(PIN_GPS_TX, PIN_GPS_RX);
 #ifdef GPS_BAUD_RATE
@@ -780,7 +780,7 @@ static void gpsUartRelease() {
 #endif
 
 void EnvironmentSensorManager::initBasicGPS() {
-#if defined(GPS_RELEASE_UART_WHEN_OFF) || defined(GPS_EN_HIGH_DRIVE)
+#if defined(GPS_RELEASE_UART_WHEN_OFF)
   gpsUartBegin();
 #else
   Serial1.setPins(PIN_GPS_TX, PIN_GPS_RX);
@@ -919,9 +919,6 @@ void EnvironmentSensorManager::start_gps() {
     return;
   #endif
 
-#if defined(GPS_EN_HIGH_DRIVE)
-  pinMode(PIN_GPS_EN, OUTPUT_H0H1);
-#endif
 #if defined(GPS_RELEASE_UART_WHEN_OFF)
   gpsUartBegin();
 #endif

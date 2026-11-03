@@ -5,6 +5,14 @@
 
 #include "XiaoNrf52Board.h"
 
+#if defined(PIN_GPS_EN)
+#ifndef PIN_GPS_EN_ACTIVE
+#error XIAO GPS enable polarity must be set
+#endif
+static_assert(PIN_GPS_EN_ACTIVE == LOW,
+              "XIAO GPS enable must be active-low (P-channel gate: low on, high off)");
+#endif
+
 #ifdef NRF52_POWER_MANAGEMENT
 // Static configuration for power management
 // Values set in variant.h defines
@@ -47,13 +55,6 @@ void XiaoNrf52Board::begin() {
 #if defined(PIN_WIRE_SDA) && defined(PIN_WIRE_SCL)
   Wire.setPins(PIN_WIRE_SDA, PIN_WIRE_SCL);
   Wire.begin();
-#endif
-
-#ifdef GPS_EN_HIGH_DRIVE
-  // Standard pad drive is under 1 mA. H0H1 is the high-drive mode that can
-  // source the GPS rail directly (it sags as the load approaches ~15 mA).
-  pinMode(PIN_GPS_EN, OUTPUT_H0H1);
-  digitalWrite(PIN_GPS_EN, !PIN_GPS_EN_ACTIVE);
 #endif
 
 #ifdef P_LORA_TX_LED
